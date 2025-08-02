@@ -30,6 +30,84 @@ def calculate_volume_ratio(volume_series, window=20):
     last_volume = volume_series.iloc[-1]
     return (last_volume / avg_volume) if avg_volume > 0 else 1.0
 
+def calculate_bb_deviation(close_prices, window=20, num_std=2):
+    ma = close_prices.rolling(window=window).mean()
+    std = close_prices.rolling(window=window).std()
+    lower_band = ma - (num_std * std)
+    upper_band = ma + (num_std * std)
+    lower_dev = ((close_prices - lower_band) / lower_band * 100).iloc[-1] if lower_band.iloc[-1] != 0 else 0
+    upper_dev = ((close_prices - upper_band) / upper_band * 100).iloc[-1] if upper_band.iloc[-1] != 0 else 0
+    return lower_dev, upper_dev
+
+def is_crash_detected(close_prices, window=3, threshold=-7):
+    if len(close_prices) < window: return False
+    recent_change = (close_prices.iloc[-1] / close_prices.iloc[-window] - 1) * 100
+    return recent_change <= threshold
+
+def is_surge_detected(close_prices, window=3, threshold=7):
+    if len(close_prices) < window: return False
+    recent_change = (close_prices.iloc[-1] / close_prices.iloc[-window] - 1) * 100
+    return recent_change >= threshold
+
+def calculate_atr(high_prices, low_prices, close_prices, window=14):
+    tr1 = high_prices - low_prices
+    tr2 = abs(high_prices - close_prices.shift(1))
+    tr3 = abs(low_prices - close_prices.shift(1))
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=window).mean()
+    return atr.iloc[-1] if len(atr) > 0 else 0
+
+def get_price_change_rate(close_prices, window=3):
+    """3일간 가격 변동률 계산"""
+    if len(close_prices) < window:
+        return 0
+    return (close_prices.iloc[-1] / close_prices.iloc[-window] - 1) * 100
+
+def get_price_change_stage(change_rate):
+    """가격 변동률에 따른 단계 분류"""
+    if change_rate <= -6:
+        return "급락"
+    elif -6 < change_rate <= -4:
+        return "급락주의"
+    elif -4 < change_rate < 4:
+        return "안정"
+    elif 4 <= change_rate < 6:
+        return "급등주의"
+    elif change_rate >= 6:
+        return "급등"
+    else:
+        return "안정"
+
+def is_buy_signal(stock_info, close_prices):
+    """매수 신호 판단 (기존 지표 + 급락 단계 활용)"""
+    deviation = stock_info['deviation']
+    rsi = stock_info['rsi']
+    macd_cross = stock_info['macd_cross']
+    volume_ratio = stock_info['volume_ratio']
+    bb_lower_dev = stock_info['bb_lower_dev']
+    
+    # 1) 기존 매수 조건
+    rule1 = (deviation <= -8 and rsi <= 40)
+    rule2 = (deviation <= -12)
+    rule3 = (bb_lower_dev <= -5 and rsi <= 35)
+    rule4 = (rsi <= 30)  # 과매도 구간 추가 조건
+    rule5 = macd_cross  # 골든 크로스 여부
+    
+    base_buy_condition = (rule1 or rule2 or rule3 or rule4) and volume_ratio >= 1.2 and rule5
+    
+    # 2) 급락 단계 반영
+    price_change_rate = get_price_change_rate(close_prices, window=3)
+    price_stage = get_price_change_stage(price_change_rate)
+    
+    # 급락 또는 급락주의 구간이면 매수에 더욱 유리한 기회로 본다
+    if price_stage in ["급락", "급락주의"]:
+        # 진입 조건 완화 혹은 우위 신호 보강 가능
+        base_buy_condition = base_buy_condition or (rsi <= 45 and volume_ratio >= 1.0)
+    
+    return base_buy_condition, price_stage
+
+
+
 # --- 데이터 로딩 함수 ---
 @st.cache_data(ttl=600)
 def get_market_data(tickers):
@@ -55,11 +133,18 @@ def get_market_data(tickers):
         try:
             hist = yf.Ticker(ticker).history(period='1y')
             if not hist.empty and len(hist) > 50:
+                bb_lower_dev, bb_upper_dev = calculate_bb_deviation(hist['Close'])
                 stock_data[ticker] = {
                     'deviation': ((hist['Close'].iloc[-1] / hist['Close'].rolling(window=50).mean().iloc[-1]) - 1) * 100,
                     'rsi': calculate_rsi(hist['Close']).iloc[-1],
                     'macd_cross': calculate_macd_signal(hist['Close']),
-                    'volume_ratio': calculate_volume_ratio(hist['Volume'])
+                    'volume_ratio': calculate_volume_ratio(hist['Volume']),
+                    'bb_lower_dev': bb_lower_dev,
+                    'bb_upper_dev': bb_upper_dev,
+                    'atr': calculate_atr(hist['High'], hist['Low'], hist['Close']),
+                    'is_crash': is_crash_detected(hist['Close']),
+                    'is_surge': is_surge_detected(hist['Close']),
+                    'close_prices': hist['Close']  # 전체 종가 시리즈 저장
                 }
             else: stock_data[ticker] = None
         except Exception: stock_data[ticker] = None
@@ -134,54 +219,98 @@ if uploaded_file is not None:
     st.plotly_chart(fig, use_container_width=True)
     st.divider()
 
-    # --- 모듈 3: 지능형 기회 포착 레이더 (v3.5) ---
-    st.subheader("📡 지능형 기회 포착 레이더")
+    # --- 모듈 3: 지능형 기회 포착 레이더 (v4.1) ---
+    st.subheader("📡 지능형 기회 포착 레이더 v4.1")
     with st.expander("ℹ️ 레이더 규칙 해석"):
         st.markdown("""
+        **매수 신호:**
         - **🟢 포착:** 투자 철학에 부합하는 **강력한 매수 검토 신호**입니다. (규칙 충족 + 거래량 동반)
         - **🟡 주의:** 매수 관심권에 근접했으나, **거래량이 부족**하여 아직 시장의 동의를 얻지 못한 상태입니다.
+        
+        **급등락 단계:**
+        - **⚡ 급락:** 3일간 -6% 이상 하락
+        - **⚠️ 급락주의:** 3일간 -3~-6% 하락
+        - **⚪️ 안정:** 3일간 -3~+3% 변동
+        - **⚠️ 급등주의:** 3일간 +3~+6% 상승
+        - **🚀 급등:** 3일간 +6% 이상 상승
+        
         - **⚪️ 안정:** 특별 변동이 없거나, **규칙의 일부 조건만 충족**하여 아직 의미 있는 신호가 아닌 상태입니다.
         """)
     
     radar_list = []
-    monitor_df = df[df['자산티어'] != '현금'].copy()
+    surge_crash_list = []
+    # 기반 티어 제외하고 모니터링
+    monitor_df = df[~df['자산티어'].isin(['현금', '기반'])].copy()
+    
     for index, row in monitor_df.iterrows():
         ticker, tier, stock_info = row['종목코드'], row['자산티어'], market_data['stocks'].get(row['종목코드'])
-        if not stock_info: continue
+        if not stock_info: 
+            continue
         
         dev, rsi, macd_cross, vol_ratio = stock_info['deviation'], stock_info['rsi'], stock_info['macd_cross'], stock_info['volume_ratio']
+        bb_lower_dev, bb_upper_dev = stock_info['bb_lower_dev'], stock_info['bb_upper_dev']
+        close_prices = stock_info['close_prices']
+        
+        # 급등락 단계 계산
+        price_change_rate = get_price_change_rate(close_prices, window=3)
+        price_stage = get_price_change_stage(price_change_rate)
+        
+        # 급등락 상태 표시
+        if price_stage == "급락":
+            crash_surge_status = f"⚡ 급락({price_change_rate:.1f}%)"
+        elif price_stage == "급락주의":
+            crash_surge_status = f"⚠️ 급락주의({price_change_rate:.1f}%)"
+        elif price_stage == "급등주의":
+            crash_surge_status = f"⚠️ 급등주의({price_change_rate:.1f}%)"
+        elif price_stage == "급등":
+            crash_surge_status = f"🚀 급등({price_change_rate:.1f}%)"
+        else:
+            crash_surge_status = f"⚪️ 안정({price_change_rate:.1f}%)"
+        
+        # 매수 신호 판단 (개선된 로직)
+        buy_signal, detected_stage = is_buy_signal(stock_info, close_prices)
+        
         status, status_order, reason = "⚪️ 안정", 3, "기준 미달"
         
-        # Tier별 규칙 검사
-        triggered = False
-        if tier == 'Tier 1' or tier == '기반':
-            rule1, rule2 = (dev <= -8.0 and rsi <= 40), (dev <= -12.0)
-            if rule1 or rule2: triggered = True
-            else: reason = f"이격도({dev:.1f}%) 또는 RSI({rsi:.1f}) 안정"
-        elif tier == 'Tier 2' or tier == 'Tier 3':
-            rule1 = dev <= -15.0 and rsi <= 35 and macd_cross
-            if rule1: triggered = True
-            else: # 실패 사유 구체화
-                if dev > -15.0: reason = f"이격도({dev:.1f}%) 안정"
-                elif rsi > 35: reason = "RSI 안정"
-                elif not macd_cross: reason = "추세 전환 신호 없음"
-        
-        # 최종 상태 결정
-        if triggered:
+        if buy_signal:
             if vol_ratio >= 1.2:
-                status, status_order, reason = "🟢 포착", 1, f"거래량 {vol_ratio:.1f}배"
+                status, status_order, reason = "🟢 포착", 1, f"매수신호 + 거래량 {vol_ratio:.1f}배"
             else:
-                status, status_order, reason = "🟡 주의", 2, f"거래량 미달 ({vol_ratio:.1f}배)"
-
+                status, status_order, reason = "🟡 주의", 2, f"매수신호 + 거래량 미달 ({vol_ratio:.1f}배)"
+        else:
+            # 실패 사유 구체화
+            if dev > -8.0: 
+                reason = f"이격도({dev:.1f}%) 안정"
+            elif rsi > 40: 
+                reason = f"RSI({rsi:.1f}) 안정"
+            elif bb_lower_dev > -5.0: 
+                reason = f"BB하단({bb_lower_dev:.1f}%) 안정"
+            elif not macd_cross: 
+                reason = "추세 전환 신호 없음"
+            elif vol_ratio < 1.2: 
+                reason = f"거래량 부족({vol_ratio:.1f}배)"
+        
         radar_list.append({
             '상태': status, '종목명': row['종목명'], '티어': tier, 
-            '핵심 현황': f"이격도 {dev:.1f}%, RSI {rsi:.1f}", 
+            '급등락': crash_surge_status,
+            '핵심 현황': f"이격도 {dev:.1f}%, RSI {rsi:.1f}, BB하단 {bb_lower_dev:.1f}%, BB상단 {bb_upper_dev:.1f}%", 
             '진단': reason, 'status_order': status_order
         })
 
     if radar_list:
         radar_df = pd.DataFrame(radar_list).sort_values(by='status_order').drop(columns=['status_order'])
         st.dataframe(radar_df, use_container_width=True, hide_index=True)
+        
+        # 급등락 신호 요약
+        crash_stocks = [row['종목명'] for row in radar_list if "급락" in row['급등락']]
+        surge_stocks = [row['종목명'] for row in radar_list if "급등" in row['급등락']]
+        
+        if crash_stocks:
+            st.warning(f"⚠️ **급락 주의:** {', '.join(crash_stocks)}")
+        if surge_stocks:
+            st.info(f"📈 **급등 감지:** {', '.join(surge_stocks)}")
+    else:
+        st.warning("⚠️ **레이더 데이터 없음:** 분석 가능한 종목 데이터가 없습니다. 엑셀 파일의 종목코드가 올바른지 확인해주세요.")
     
     st.divider()
     st.subheader("📋 포트폴리오 상세 내역")
