@@ -5,13 +5,13 @@ import yfinance as yf
 import requests
 import gspread
 from gspread_dataframe import get_as_dataframe
-import numpy as np # numpy import 추가
+import numpy as np
 
 # --- 페이지 설정 ---
-st.set_page_config(page_title="ROgicX 작전 본부 v6.0", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="ROgicX 작전 본부 v6.9", page_icon="🤖", layout="wide")
 
 # ==============================================================================
-# --- 모든 계산 함수 (v6.0에 맞게 일부 수정) ---
+# --- 모든 계산 함수 ---
 # ==============================================================================
 def calculate_rsi(close_prices, window=14):
     """RSI(상대강도지수) 계산"""
@@ -19,52 +19,15 @@ def calculate_rsi(close_prices, window=14):
     gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
     rs = gain / loss
-    # loss가 0일 경우 RSI를 100으로 설정하여 '과매수' 상태로 해석
     rsi_series = 100 - (100 / (1 + rs))
     return rsi_series.fillna(100)
-
-def calculate_macd_signal(close_prices, fast=12, slow=26, signal=9):
-    """최근 3일 내 MACD 골든크로스 발생 여부 확인"""
-    exp1 = close_prices.ewm(span=fast, adjust=False).mean()
-    exp2 = close_prices.ewm(span=slow, adjust=False).mean()
-    macd = exp1 - exp2
-    signal_line = macd.ewm(span=signal, adjust=False).mean()
-    
-    # 최근 3일 동안의 MACD와 Signal Line을 확인
-    recent_macd = macd.iloc[-3:]
-    recent_signal = signal_line.iloc[-3:]
-    
-    # (MACD가 Signal 아래에 있다가 위로 올라오는) 골든크로스 패턴 확인
-    crossed_up = (recent_macd.shift(1) < recent_signal.shift(1)) & (recent_macd > recent_signal)
-    
-    return crossed_up.any()
 
 def calculate_volume_ratio(volume_series, window=20):
     """최근 거래량 / 20일 평균 거래량 비율 계산"""
     if len(volume_series) < window: return 1.0
-    # 0으로 나누는 것을 방지하기 위해 작은 값(epsilon)을 더함
     avg_volume = volume_series.rolling(window=window).mean().iloc[-1]
     last_volume = volume_series.iloc[-1]
     return (last_volume / avg_volume) if avg_volume > 1e-6 else 1.0
-
-def calculate_bb_deviation(close_prices, window=20, num_std=2):
-    """볼린저 밴드 이탈도 계산"""
-    ma = close_prices.rolling(window=window).mean()
-    std = close_prices.rolling(window=window).std()
-    lower_band = ma - (num_std * std)
-    upper_band = ma + (num_std * std)
-    lower_dev = ((close_prices - lower_band) / lower_band * 100).iloc[-1] if lower_band.iloc[-1] != 0 else 0
-    upper_dev = ((close_prices - upper_band) / upper_band * 100).iloc[-1] if upper_band.iloc[-1] != 0 else 0
-    return lower_dev, upper_dev
-
-def calculate_atr(high_prices, low_prices, close_prices, window=14):
-    """ATR(Average True Range) 계산"""
-    tr1 = high_prices - low_prices
-    tr2 = abs(high_prices - close_prices.shift(1))
-    tr3 = abs(low_prices - close_prices.shift(1))
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(window=window).mean()
-    return atr.iloc[-1] if len(atr) > 0 else 0
 
 def get_price_change_rate(close_prices, window=3):
     """N일간 가격 변동률 계산"""
@@ -72,70 +35,101 @@ def get_price_change_rate(close_prices, window=3):
         return 0
     return (close_prices.iloc[-1] / close_prices.iloc[-window] - 1) * 100
 
-# v6.0에서 더 이상 사용되지 않는 함수들: is_crash_detected, is_surge_detected, get_price_change_stage, is_buy_signal
+def calculate_bb_deviation(close_prices, window=20, num_std=2):
+    """볼린저 밴드 하단선 대비 현재가의 이격도를 계산합니다."""
+    ma = close_prices.rolling(window=window).mean()
+    std = close_prices.rolling(window=window).std()
+    lower_band = ma - (num_std * std)
+    last_price = close_prices.iloc[-1]
+    last_lower_band = lower_band.iloc[-1]
+    if last_lower_band == 0: return 0.0
+    deviation = ((last_price / last_lower_band) - 1) * 100
+    return deviation
 
 # ==============================================================================
-# --- v6.0 핵심 분석 모듈 (신규 추가) ---
+# --- v6.9 핵심 분석 모듈 (최종 버전) ---
 # ==============================================================================
-def analyze_stock_v6(stock_info, tier):
+def analyze_stock_v6_9(stock_info, tier, params):
     """
-    '지능형 레이더 v6.0'의 규칙에 따라 종목을 분석하고 상태를 진단합니다.
+    '지능형 레이더 v6.9'의 규칙에 따라 종목을 분석하고 상태를 진단합니다.
     """
     if not stock_info or 'close_prices' not in stock_info or stock_info['close_prices'].empty:
         return None
 
-    # --- 1. 개별 규칙(체크리스트) 통과 여부 확인 ---
+    # --- 1. 5대 분석 지표 추출 ---
+    deviation = stock_info.get('deviation', 0)
+    bb_lower_dev = stock_info.get('bb_lower_dev', 0)
     rsi = stock_info.get('rsi', 50)
-    valuation_pass = rsi <= 35
-    
     macd_cross = stock_info.get('macd_cross', False)
-    trend_reversal_pass = macd_cross
-    
+    macd_latest = stock_info.get('macd_latest', 0)
+    signal_latest = stock_info.get('signal_latest', 0)
     volume_ratio = stock_info.get('volume_ratio', 0)
-    volume_check_pass = volume_ratio >= 1.5
-
-    # --- 2. 가격 변동성 분석 ---
     price_change_rate = get_price_change_rate(stock_info['close_prices'], window=3)
+
+    # --- 2. 티어별 규칙 적용 ---
+    tier_num_str = tier[5] if len(tier) > 5 and tier.startswith('Tier') else '4'
     
-    # --- 3. 최종 상태(Status) 결정: 티어별 규칙 적용 ---
-    status = "⚪️ 안정"
-    status_order = 3
-    
+    price_attractive_bb = (bb_lower_dev <= params[f'tier{tier_num_str}_bb_dev'])
+    price_attractive_ma = (deviation <= params[f'tier{tier_num_str}_ma_dev'])
+    price_attractive = price_attractive_bb or price_attractive_ma
+
+    energy_condensed = (rsi <= params[f'tier{tier_num_str}_rsi'])
+    market_agreed = (volume_ratio >= params[f'tier{tier_num_str}_vol'])
+
+    is_watching = False
     is_captured = False
-    if tier == 'Tier 1':
-        if valuation_pass and volume_check_pass:
+    if tier in ['Tier 1', 'Tier 4']:
+        is_watching = price_attractive and energy_condensed
+        if is_watching and market_agreed:
             is_captured = True
     elif tier == 'Tier 2':
-        if valuation_pass and trend_reversal_pass and volume_check_pass:
+        is_watching = price_attractive and energy_condensed and macd_cross
+        if is_watching and market_agreed:
             is_captured = True
 
-    if is_captured:
-        status, status_order = "🟢 포착", 1
-    elif (tier == 'Tier 1' and valuation_pass) or \
-         (tier == 'Tier 2' and valuation_pass and trend_reversal_pass):
-        status, status_order = "🟡 감시", 2
+    # --- 3. 상태 설명 및 수치 텍스트 생성 ---
+    if price_attractive:
+        price_desc_parts = []
+        if price_attractive_bb: price_desc_parts.append(f"BB({bb_lower_dev:.1f}%)")
+        if price_attractive_ma: price_desc_parts.append(f"MA({deviation:.1f}%)")
+        price_text = " ".join(price_desc_parts)
+    else:
+        price_text = f"기준 미달 (BB:{bb_lower_dev:.1f}%, MA:{deviation:.1f}%)"
+    
+    energy_desc = "과매도" if rsi <= 35 else "과열" if rsi >= 65 else "중립"
+    energy_text = f"{energy_desc} (RSI:{rsi:.1f})"
 
-    if price_change_rate >= 7:
-        status, status_order = "⚠️ 과열", 4
-    elif price_change_rate <= -7:
-        status, status_order = "⚡ 변동성", 5
+    if macd_cross:
+        trend_text = "상승 전환"
+    else:
+        trend_text = "상승 추세" if macd_latest > signal_latest else "하락 추세"
 
-    # --- 4. 최종 결과 정리 ---
+    volume_desc = "급증" if volume_ratio >= 1.5 else "부족" if volume_ratio < 1.0 else "평균"
+    volume_text = f"{volume_desc} ({volume_ratio:.1f}배)"
+
+    # --- 4. 최종 상태 및 우선순위 결정 ---
+    status, status_order = "⚪️ 안정", 4
+    if is_watching: status, status_order = "🟡 감시", 2
+    if is_captured: status, status_order = "🟢 포착", 1
+
+    if price_change_rate <= -7 and status == "⚪️ 안정": status, status_order = "⚡ 변동성", 3
+    if price_change_rate >= 7: status, status_order = "⚠️ 과열", 5
+
+    # --- 5. 최종 결과 포맷팅 ---
     return {
         '상태': status,
         '종목명': stock_info['name'],
         '티어': tier,
-        '가격 변동': f"{price_change_rate:.1f}%",
-        '가치 평가': f"{'✅' if valuation_pass else '❌'} (RSI: {rsi:.1f})",
-        '추세 전환': f"{'✅' if trend_reversal_pass else '❌'}",
-        '거래량 확인': f"{'✅' if volume_check_pass else '❌'} ({volume_ratio:.1f}배)",
+        '가격 매력도': f"{'✅' if price_attractive else '❌'} ({price_text})",
+        '에너지 응축': f"{'✅' if energy_condensed else '❌'} ({energy_text})",
+        '추세 전환': f"{'✅' if macd_cross else '❌'} ({trend_text})",
+        '시장 동의': f"{'✅' if market_agreed else '❌'} ({volume_text})",
         'status_order': status_order
     }
 
-# --- 데이터 로딩 함수 (기존과 동일) ---
+# --- 데이터 로딩 함수 ---
 @st.cache_data(ttl=600)
 def load_data_from_gsheet():
-    """구글 시트에서 포트폴리오 데이터를 로드합니다."""
     try:
         gc = gspread.service_account_from_dict(st.secrets["gcp_service_account"])
         SPREADSHEET_KEY = '1AG2QrAlcjksI2CWp_6IuL5jCrFhzpOGl7casHvFGvi8'
@@ -146,69 +140,66 @@ def load_data_from_gsheet():
         return df
     except Exception as e:
         st.error(f"Google Sheets 데이터를 불러오는 데 실패했습니다: {e}")
-        st.warning("secrets.toml 설정과 구글 시트 공유 설정을 다시 확인해주세요.")
         return None
-    
+
 def get_macro_data():
-    """파일 업로드 없이 거시 지표만 가져옵니다. (안정성 강화)"""
     macro_data = {}
     try:
         fng_response = requests.get("https://api.alternative.me/fng/?limit=1")
         macro_data['fng_value'] = int(fng_response.json()['data'][0]['value'])
     except Exception: macro_data['fng_value'] = None
-    try: 
+    try:
         macro_data['vix'] = yf.Ticker("^VIX").history(period='1d')['Close'][0]
     except Exception: macro_data['vix'] = None
-    
     try:
         dxy_data = yf.Ticker("DX-Y.NYB").history(period='5d')['Close']
-        if len(dxy_data) >= 2:
-            macro_data['dxy_change'] = (dxy_data.iloc[-1] / dxy_data.iloc[-2] - 1) * 100
-        else:
-            macro_data['dxy_change'] = 0
-    except Exception: 
-        macro_data['dxy_change'] = 0
-        
+        if len(dxy_data) >= 2: macro_data['dxy_change'] = (dxy_data.iloc[-1] / dxy_data.iloc[-2] - 1) * 100
+        else: macro_data['dxy_change'] = 0
+    except Exception: macro_data['dxy_change'] = 0
     try:
         oil_data = yf.Ticker("CL=F").history(period='5d')['Close']
-        if len(oil_data) >= 2:
-            macro_data['oil_change'] = (oil_data.iloc[-1] / oil_data.iloc[-2] - 1) * 100
-        else:
-            macro_data['oil_change'] = 0
-    except Exception: 
-        macro_data['oil_change'] = 0
-        
+        if len(oil_data) >= 2: macro_data['oil_change'] = (oil_data.iloc[-1] / oil_data.iloc[-2] - 1) * 100
+        else: macro_data['oil_change'] = 0
+    except Exception: macro_data['oil_change'] = 0
     return macro_data
 
 @st.cache_data
 def get_stock_data(tickers, stock_names):
-    """개별 종목 데이터만 가져옵니다."""
     stock_data = {}
-    # Ticker와 종목명을 매핑하는 딕셔너리 생성
     ticker_to_name = dict(zip(tickers, stock_names))
-
     valid_tickers = [t for t in tickers if t and isinstance(t, str) and t != 'CASH']
     for ticker in valid_tickers:
         try:
             hist = yf.Ticker(ticker).history(period='1y')
             if not hist.empty and len(hist) > 50:
-                bb_lower_dev, bb_upper_dev = calculate_bb_deviation(hist['Close'])
+                # MACD Calculation for detailed trend status
+                exp1 = hist['Close'].ewm(span=12, adjust=False).mean()
+                exp2 = hist['Close'].ewm(span=26, adjust=False).mean()
+                macd = exp1 - exp2
+                signal_line = macd.ewm(span=9, adjust=False).mean()
+                
+                recent_macd = macd.iloc[-3:]
+                recent_signal = signal_line.iloc[-3:]
+                crossed_up = (recent_macd.shift(1) < recent_signal.shift(1)) & (recent_macd > recent_signal)
+
                 stock_data[ticker] = {
-                    'name': ticker_to_name.get(ticker, ticker), # 종목명 추가
+                    'name': ticker_to_name.get(ticker, ticker),
                     'deviation': ((hist['Close'].iloc[-1] / hist['Close'].rolling(window=50).mean().iloc[-1]) - 1) * 100,
+                    'bb_lower_dev': calculate_bb_deviation(hist['Close']),
                     'rsi': calculate_rsi(hist['Close']).iloc[-1],
-                    'macd_cross': calculate_macd_signal(hist['Close']),
+                    'macd_cross': crossed_up.any(),
+                    'macd_latest': macd.iloc[-1],
+                    'signal_latest': signal_line.iloc[-1],
                     'volume_ratio': calculate_volume_ratio(hist['Volume']),
-                    'bb_lower_dev': bb_lower_dev,
-                    'bb_upper_dev': bb_upper_dev,
-                    'atr': calculate_atr(hist['High'], hist['Low'], hist['Close']),
                     'close_prices': hist['Close']
                 }
             else: stock_data[ticker] = None
-        except Exception: stock_data[ticker] = None
+        except Exception as e:
+            st.error(f"Failed to get data for {ticker}: {e}")
+            stock_data[ticker] = None
     return stock_data
 
-# --- 분석/해석 함수 (기존과 동일) ---
+# --- 분석/해석 함수 ---
 def calculate_opportunity_score(macro_data):
     reasons = {}
     fng_val, vix_val, dxy_change, oil_change = macro_data.get('fng_value'), macro_data.get('vix'), macro_data.get('dxy_change'), macro_data.get('oil_change')
@@ -219,10 +210,9 @@ def calculate_opportunity_score(macro_data):
     return sum(reasons.values()), reasons
 
 # --- UI 렌더링 ---
-st.title("🤖 ROgicX 작전 본부 v6.0")
+st.title("🤖 ROgicX 작전 본부 v6.9 (Final)")
 
-
-# --- 모듈 1: 전장 상황판 (기존과 동일) ---
+# --- 모듈 1: 전장 상황판 ---
 st.subheader("🌐 전장 상황판")
 macro_data = get_macro_data()
 total_score, score_reasons = calculate_opportunity_score(macro_data)
@@ -248,6 +238,7 @@ with cols[4]:
     guidance = "🔥 역매수 작전 고려" if total_score >= 7 else "🟡 기회 감시 강화" if total_score >= 4 else "⚪️ 훈련의 날"
     st.metric("종합 기회 지수", f"**{total_score}**"); st.markdown(f"**{guidance}**")
 
+
 st.divider()
 
 # --- 포트폴리오 데이터를 로드하여 나머지 모듈 표시 ---
@@ -259,7 +250,7 @@ if df is not None:
     stock_data = get_stock_data(tickers_to_fetch, stock_names_to_fetch)
     total_score, _ = calculate_opportunity_score(macro_data)
 
-    # --- 모듈 2: 아군 현황판 (기존과 동일) ---
+    # --- 모듈 2: 아군 현황판 ---
     st.subheader("📊 아군 현황판")
     cash_df = df[(df['자산티어'] == '현금') & (df['종목명'] == 'CMA')]; available_cash = cash_df['현재평가금액'].sum()
     invested_df = df[~df['자산티어'].isin(['현금', '관심종목', 'Tier 4', '기반'])]; total_invested_value = invested_df['현재평가금액'].sum()
@@ -289,97 +280,119 @@ if df is not None:
             fig.add_trace(go.Bar(x=[tier], y=[current_val], name='현재 비중', marker_color='#1f77b4', showlegend=show_legend_current, text=f"{current_val:.1f}%", textposition='inside'))
     fig.update_layout(title_text="운용 자산 티어별 비중 (기반 자산 제외)", barmode='overlay', yaxis_title='비중 (%)', legend_title_text=None, uniformtext_minsize=8, uniformtext_mode='hide')
     st.plotly_chart(fig, use_container_width=True)
+
     st.divider()
 
     # ==============================================================================
-    # --- 모듈 3: 지능형 기회 포착 레이더 (v6.0으로 전면 교체) ---
+    # --- 모듈 3: 지능형 기회 포착 레이더 (v6.9) ---
     # ==============================================================================
-    st.subheader("📡 지능형 기회 포착 레이더 v6.0")
+    st.subheader("📡 지능형 기회 포착 레이더 v6.9")
 
-    with st.expander("ℹ️ v6.0 레이더 규칙: '종합 검진표' 시스템"):
-        st.markdown("""
-        **'지능형 레이더 v6.0'**은 각 종목의 상태를 다각도로 진단하는 **'종합 검진표'**입니다.
-        단순 결과가 아닌, **분석 과정을 투명하게 공개**하여 MASTER의 최종 판단을 돕습니다.
+    sensitivity_level = st.radio(
+        "감시 민감도 설정:",
+        ('엄격하게 (Strict)', '중간 (Normal)', '널널하게 (Loose)'),
+        index=1, horizontal=True, key='sensitivity'
+    )
+    
+    sensitivity_map = {
+        '엄격하게 (Strict)': 'Strict', '중간 (Normal)': 'Normal', '널널하게 (Loose)': 'Loose'
+    }
+    selected_sensitivity = sensitivity_map[sensitivity_level]
+
+    # 민감도 파라미터 재설계 (아마존 케이스 반영)
+    sensitivity_params = {
+        'Strict': {'tier1_bb_dev': -3, 'tier1_ma_dev': -10, 'tier1_rsi': 35, 'tier1_vol': 1.5, 'tier2_bb_dev': -6, 'tier2_ma_dev': -18, 'tier2_rsi': 30, 'tier2_vol': 2.0, 'tier4_bb_dev': -4, 'tier4_ma_dev': -12, 'tier4_rsi': 30, 'tier4_vol': 1.5},
+        'Normal': {'tier1_bb_dev': -2, 'tier1_ma_dev': -6,  'tier1_rsi': 40, 'tier1_vol': 1.2, 'tier2_bb_dev': -5, 'tier2_ma_dev': -15, 'tier2_rsi': 35, 'tier2_vol': 1.5, 'tier4_bb_dev': -3, 'tier4_ma_dev': -10, 'tier4_rsi': 35, 'tier4_vol': 1.2},
+        'Loose':  {'tier1_bb_dev': -1, 'tier1_ma_dev': -5,  'tier1_rsi': 45, 'tier1_vol': 1.0, 'tier2_bb_dev': -4, 'tier2_ma_dev': -12, 'tier2_rsi': 40, 'tier2_vol': 1.2, 'tier4_bb_dev': -2, 'tier4_ma_dev': -8,  'tier4_rsi': 40, 'tier4_vol': 1.0}
+    }
+    current_params = sensitivity_params[selected_sensitivity]
+
+    with st.expander("ℹ️ v6.9 레이더 규칙: '하이브리드' 시스템"):
+        st.markdown(f"""
+        **'지능형 레이더 v6.9'** 은 **하이브리드 가격 매력도**와 **상세 수치**를 통해 분석의 정확성과 직관성을 극대화합니다.
 
         ---
-        
-        #### 🩺 5단계 상태 진단 시스템
-        | 상태 | 아이콘 | 의미 |
-        | :--- | :--- | :--- |
-        | **포착** | 🟢 | 모든 매수 조건 충족. 즉각적인 분석이 필요한 **최우선 타겟**. |
-        | **감시** | 🟡 | 핵심 조건은 충족했으나, 최종 확인(거래량 등)이 필요한 상태. |
-        | **안정** | ⚪️ | 특별한 기회나 위협이 없는 '조용한' 상태. |
-        | **과열** | ⚠️ | 단기 급등으로 추격 매수의 위험이 높은 상태. (3일간 7% 이상 상승) |
-        | **변동성** | ⚡ | 최근 주가 변동성이 매우 커져 주의가 필요한 상태. (3일간 7% 이상 하락) |
-
+        #### ✅ 4대 분석 체크리스트
+        - **가격 매력도:** **볼린저 밴드** 또는 **50일 이평선** 기준 중 하나라도 충족하면 통과 (OR 조건)
+        - **에너지 응축:** RSI 지표 (과매도 상태에 진입했는가?)
+        - **추세 전환:** MACD 골든크로스 (하락을 멈추고 상승으로 전환하는가?)
+        - **시장 동의:** 거래량 비율 (시장의 관심이 쏠려있는가?)
         ---
-
-        #### ✅ 체크리스트 항목별 기준
-        - **가치 평가:** `RSI <= 35` 인가? (가격이 저렴한가?)
-        - **추세 전환:** 최근 3일 내 `MACD 골든크로스`가 발생했는가? (하락이 멈췄는가?)
-        - **거래량 확인:** `최근 거래량 >= 20일 평균의 1.5배` 인가? (시장의 관심이 있는가?)
-
+        #### 🚦 상태 우선순위
+        `🟢 포착` > `🟡 감시` > `⚡ 변동성` > `⚪️ 안정` > `⚠️ 과열`
+        - **변동성:** 다른 조건은 만족하지 못했으나, 3일간 -7% 이상 급락하여 주목이 필요한 상태.
+        - **과열:** 다른 모든 조건보다 우선하는 리스크 관리 신호. (3일간 +7% 이상 급등)
         ---
-        
-        #### 🎯 티어별 '포착(🟢)' 규칙
-        - **Tier 1 (코어 자산):** `가치 평가 ✅` AND `거래량 확인 ✅`
-        - **Tier 2 (위성 자산):** `가치 평가 ✅` AND `추세 전환 ✅` AND `거래량 확인 ✅`
+        #### 🎯 현재 민감도 기준 ('{sensitivity_level}')
+        - **Tier 1:**
+            - `가격 매력도`: BB ≤ {current_params['tier1_bb_dev']}% 또는 MA ≤ {current_params['tier1_ma_dev']}%
+            - `에너지 응축`: RSI ≤ {current_params['tier1_rsi']}
+            - `시장 동의`: 거래량 ≥ {current_params['tier1_vol']}배
+        - **Tier 2:**
+            - `가격 매력도`: BB ≤ {current_params['tier2_bb_dev']}% 또는 MA ≤ {current_params['tier2_ma_dev']}%
+            - `에너지 응축`: RSI ≤ {current_params['tier2_rsi']}
+            - `추세 전환`: MACD 골든크로스 발생
+            - `시장 동의`: 거래량 ≥ {current_params['tier2_vol']}배
+        - **Tier 4:**
+            - `가격 매력도`: BB ≤ {current_params['tier4_bb_dev']}% 또는 MA ≤ {current_params['tier4_ma_dev']}%
+            - `에너지 응축`: RSI ≤ {current_params['tier4_rsi']}
+            - `시장 동의`: 거래량 ≥ {current_params['tier4_vol']}배
         """)
 
     radar_list = []
-    # '현금', '기반' 티어를 제외한 모든 자산을 모니터링
     monitor_df = df[~df['자산티어'].isin(['현금', '기반'])].copy()
 
     for index, row in monitor_df.iterrows():
-        ticker = row['종목코드']
-        tier = row['자산티어']
-        
+        ticker, tier = row['종목코드'], row['자산티어']
+        if tier not in ['Tier 1', 'Tier 2', 'Tier 4']:
+            tier = 'Tier 4'
+
         stock_info = stock_data.get(ticker)
         if stock_info:
-            analysis_result = analyze_stock_v6(stock_info, tier)
+            analysis_result = analyze_stock_v6_9(stock_info, tier, current_params)
             if analysis_result:
                 radar_list.append(analysis_result)
 
     if radar_list:
         radar_df = pd.DataFrame(radar_list)
-        radar_df = radar_df.sort_values(by='status_order').drop(columns=['status_order'])
+        radar_df_display = radar_df[['상태', '종목명', '티어', '가격 매력도', '에너지 응축', '추세 전환', '시장 동의', 'status_order']]
+        radar_df_display = radar_df_display.sort_values(by='status_order').drop(columns=['status_order'])
         
         st.dataframe(
-            radar_df,
+            radar_df_display,
             use_container_width=True,
             hide_index=True,
             column_config={
-                "상태": st.column_config.TextColumn(width="small"),
-                "종목명": st.column_config.TextColumn(width="small"),
-                "티어": st.column_config.TextColumn(width="small"),
+                "상태": st.column_config.TextColumn("상태", width="small"),
+                "종목명": st.column_config.TextColumn("종목명", width="small"),
+                "티어": st.column_config.TextColumn("티어", width="small"),
             }
         )
     else:
-        st.warning("⚠️ **레이더 데이터 없음:** 분석 가능한 종목 데이터가 없습니다. 엑셀 파일의 종목코드를 확인해주세요.")
+        st.warning("⚠️ **레이더 데이터 없음:** 분석 가능한 종목 데이터가 없습니다.")
     
     st.divider()
     st.subheader("📋 포트폴리오 상세 내역")
     st.dataframe(df, hide_index=True)
     
-    # --- 모듈 4: GEM: Finance 보고용 브리핑 생성 (v6.0 데이터 구조에 맞게 수정) ---
+    # --- 모듈 4: GEM: Finance 보고용 브리핑 생성 ---
     st.subheader("✨ GEM: Finance 보고용 브리핑 생성")
     if st.button("원클릭 브리핑 생성"):
         guidance = "🔥 역매수 작전 고려" if total_score >= 7 else "🟡 기회 감시 강화" if total_score >= 4 else "⚪️ 훈련의 날"
         
         if 'radar_df' in locals() and not radar_df.empty:
-            # 레이더에서 유의미한 신호('포착', '감시')만 필터링
-            significant_alerts = radar_df[radar_df['상태'].isin(['🟢 포착', '🟡 감시'])]
+            significant_alerts = radar_df[radar_df['상태'].isin(['🟢 포착', '🟡 감시', '⚡ 변동성'])]
             
             if not significant_alerts.empty:
                 alerts_text = ""
                 for _, row in significant_alerts.iterrows():
-                    # v6.0의 체크리스트 결과를 브리핑에 포함
                     alerts_text += (f"- **{row['종목명']}** ({row['티어']}): {row['상태']} | "
-                                    f"가치: {row['가치 평가']} | "
-                                    f"추세: {row['추세 전환']} | "
-                                    f"거래량: {row['거래량 확인']}\n")
+                                    f"가격: {row['가격 매력도']}, "
+                                    f"에너지: {row['에너지 응축']}, "
+                                    f"추세: {row['추세 전환']}, "
+                                    f"거래량: {row['시장 동의']}\n")
             else:
-                alerts_text = "현재 포착된 유의미한 매수/감시 신호는 없습니다."
+                alerts_text = "현재 포착된 유의미한 매수/감시/변동성 신호는 없습니다."
         else:
             alerts_text = "레이더 데이터가 없어 분석할 신호가 없습니다."
 
@@ -388,7 +401,7 @@ if df is not None:
 - **종합 기회 지수:** {total_score}점
 - **행동 지침:** {guidance}
 
-### 2. 기회 포착 레이더 현황 (v6.0)
+### 2. 기회 포착 레이더 현황 (v6.9)
 {alerts_text}
 
 ### 3. 질문
