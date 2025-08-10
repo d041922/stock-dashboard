@@ -9,11 +9,13 @@ import gspread
 from gspread_dataframe import get_as_dataframe
 from datetime import datetime
 import plotly.graph_objects as go
+import requests
+from bs4 import BeautifulSoup
 
 # ==============================================================================
 # --- 2. 페이지 기본 설정 ---
 # ==============================================================================
-st.set_page_config(page_title="ROgicX 작전 본부 v16.3 (Final Polish)", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="ROgicX 작전 본부 v17.0 (Real Data Integration)", page_icon="🎯", layout="wide")
 
 
 # ==============================================================================
@@ -47,11 +49,45 @@ def calculate_bollinger_bands(close_prices, window=20, num_std=2):
     return upper, ma, lower
 
 # ==============================================================================
-# --- 4. 매크로 리스크 분석 모듈 ---
+# --- 4. 매크로 리스크 분석 모듈 (실제 데이터 연동) ---
 # ==============================================================================
 @st.cache_data(ttl=600)
+def fetch_fear_and_greed_index():
+    """feargreedmeter.com에서 Fear & Greed Index를 스크레이핑합니다."""
+    try:
+        url = 'https://feargreedmeter.com/'
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        fgi_element = soup.find('div', class_='text-center text-4xl font-semibold mb-1 text-white')
+        if fgi_element and fgi_element.text.strip().isdigit():
+            return int(fgi_element.text.strip())
+        return 50 # 실패 시 중립 값 반환
+    except Exception as e:
+        st.warning(f"공포&탐욕 지수 로드 실패: {e}")
+        return 50
+
+@st.cache_data(ttl=600)
+def fetch_put_call_ratio():
+    """YCharts에서 Put/Call Ratio를 스크레이핑합니다."""
+    try:
+        url = 'https://ycharts.com/indicators/cboe_equity_put_call_ratio'
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        value_div = soup.find('div', class_='key-stat-val')
+        if value_div:
+            return float(value_div.text.strip())
+        return 1.0 # 실패 시 중립 값 반환
+    except Exception as e:
+        st.warning(f"Put/Call 비율 로드 실패: {e}")
+        return 1.0
+
+@st.cache_data(ttl=600)
 def get_macro_indicators():
-    """주요 매크로 지표를 yfinance를 통해 가져옵니다."""
+    """주요 매크로 지표를 API 및 스크레이핑을 통해 가져옵니다."""
     tickers = {
         "VIX": "^VIX", "DXY": "DX-Y.NYB", "US10Y": "^TNX", "US30Y": "^TYX",
         "WTI": "CL=F", "Copper": "HG=F"
@@ -62,13 +98,13 @@ def get_macro_indicators():
     for name, ticker in tickers.items():
         if not data['Close'][ticker].isnull().all():
             latest_data[name] = data['Close'][ticker].iloc[-1]
-            latest_data[f"{name}_change"] = data['Close'][ticker].pct_change().iloc[-1] * 100
     
     if 'US10Y' in latest_data and 'US30Y' in latest_data:
         latest_data['Yield_Spread'] = latest_data['US30Y'] - latest_data['US10Y']
     
-    latest_data['Fear_Greed'] = np.random.randint(20, 80)
-    latest_data['Put_Call_Ratio'] = np.random.uniform(0.7, 1.3)
+    # 실제 데이터로 대체
+    latest_data['Fear_Greed'] = fetch_fear_and_greed_index()
+    latest_data['Put_Call_Ratio'] = fetch_put_call_ratio()
     
     return latest_data
 
@@ -285,7 +321,7 @@ def display_macro_risk_dashboard():
             color = 'red' if score > 70 else 'orange' if score > 40 else 'green'
             return f'color: {color}'
         
-        st.dataframe(risk_df.style.applymap(color_risk, subset=['리스크 점수']), use_container_width=True, hide_index=True)
+        st.dataframe(risk_df.style.map(color_risk, subset=['리스크 점수']), use_container_width=True, hide_index=True)
 
     st.markdown("---")
     return total_score, status
@@ -356,26 +392,14 @@ def create_rebalancing_tab(full_df):
         fig = go.Figure()
         
         # 겹쳐진 막대그래프 로직 (범례 중복 제거 및 색상/테두리 개선)
-        # 더 큰 값을 뒤에, 작은 값을 앞에 그리기 위해 데이터 분리
-        df_target_larger = alloc_df[alloc_df['목표 비중'] >= alloc_df['현재 비중']]
-        df_current_larger = alloc_df[alloc_df['목표 비중'] < alloc_df['현재 비중']]
-
-        # 목표가 크거나 같은 경우: 목표(뒤) -> 현재(앞)
-        fig.add_trace(go.Bar(name='목표 비중', x=df_target_larger['tier'], y=df_target_larger['목표 비중'],
-                           marker_color='lightgray', marker_line=dict(color='black', width=1),
-                           legendgroup='target', showlegend=True))
-        fig.add_trace(go.Bar(name='현재 비중', x=df_target_larger['tier'], y=df_target_larger['현재 비중'],
-                           marker_color='steelblue', marker_line=dict(color='black', width=1),
-                           legendgroup='current', showlegend=True))
-
-        # 현재가 더 큰 경우: 현재(뒤) -> 목표(앞)
-        fig.add_trace(go.Bar(name='현재 비중', x=df_current_larger['tier'], y=df_current_larger['현재 비중'],
-                           marker_color='steelblue', marker_line=dict(color='black', width=1),
-                           legendgroup='current', showlegend=False))
-        fig.add_trace(go.Bar(name='목표 비중', x=df_current_larger['tier'], y=df_current_larger['목표 비중'],
-                           marker_color='lightgray', marker_line=dict(color='black', width=1),
-                           legendgroup='target', showlegend=False))
-
+        fig.add_trace(go.Bar(
+            name='목표 비중', x=alloc_df['tier'], y=alloc_df['목표 비중'],
+            marker_color='lightgray', marker_line=dict(color='black', width=1)
+        ))
+        fig.add_trace(go.Bar(
+            name='현재 비중', x=alloc_df['tier'], y=alloc_df['현재 비중'],
+            marker_color='steelblue', marker_line=dict(color='black', width=1)
+        ))
 
         fig.update_layout(barmode='overlay', title_text='목표 vs 현재 자산 배분', 
                           yaxis_title='비중 (%)', legend_traceorder="reversed")
@@ -389,7 +413,7 @@ def create_rebalancing_tab(full_df):
 def main():
     st.markdown("""
     <div style='text-align: center; padding: 15px; background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); border-radius: 10px; margin-bottom: 20px;'>
-        <h1 style='color: white; margin: 0;'>🎯 ROgicX 작전 본부 v16.3</h1>
+        <h1 style='color: white; margin: 0;'>🎯 ROgicX 작전 본부 v17.0</h1>
         <p style='color: white; margin: 5px 0 0 0; font-size: 16px;'>핵심 임무 중심의 2차 판단 지원 시스템</p>
     </div>
     """, unsafe_allow_html=True)
