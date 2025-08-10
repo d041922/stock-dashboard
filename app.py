@@ -392,14 +392,26 @@ def create_rebalancing_tab(full_df):
         fig = go.Figure()
         
         # 겹쳐진 막대그래프 로직 (범례 중복 제거 및 색상/테두리 개선)
-        fig.add_trace(go.Bar(
-            name='목표 비중', x=alloc_df['tier'], y=alloc_df['목표 비중'],
-            marker_color='lightgray', marker_line=dict(color='black', width=1)
-        ))
-        fig.add_trace(go.Bar(
-            name='현재 비중', x=alloc_df['tier'], y=alloc_df['현재 비중'],
-            marker_color='steelblue', marker_line=dict(color='black', width=1)
-        ))
+        # 더 큰 값을 뒤에, 작은 값을 앞에 그리기 위해 데이터 분리
+        df_target_larger = alloc_df[alloc_df['목표 비중'] >= alloc_df['현재 비중']]
+        df_current_larger = alloc_df[alloc_df['목표 비중'] < alloc_df['현재 비중']]
+
+        # 목표가 크거나 같은 경우: 목표(뒤) -> 현재(앞)
+        fig.add_trace(go.Bar(name='목표 비중', x=df_target_larger['tier'], y=df_target_larger['목표 비중'],
+                           marker_color='lightgray', marker_line=dict(color='black', width=1),
+                           legendgroup='target', showlegend=True))
+        fig.add_trace(go.Bar(name='현재 비중', x=df_target_larger['tier'], y=df_target_larger['현재 비중'],
+                           marker_color='steelblue', marker_line=dict(color='black', width=1),
+                           legendgroup='current', showlegend=True))
+
+        # 현재가 더 큰 경우: 현재(뒤) -> 목표(앞)
+        fig.add_trace(go.Bar(name='현재 비중', x=df_current_larger['tier'], y=df_current_larger['현재 비중'],
+                           marker_color='steelblue', marker_line=dict(color='black', width=1),
+                           legendgroup='current', showlegend=False))
+        fig.add_trace(go.Bar(name='목표 비중', x=df_current_larger['tier'], y=df_current_larger['목표 비중'],
+                           marker_color='lightgray', marker_line=dict(color='black', width=1),
+                           legendgroup='target', showlegend=False))
+
 
         fig.update_layout(barmode='overlay', title_text='목표 vs 현재 자산 배분', 
                           yaxis_title='비중 (%)', legend_traceorder="reversed")
