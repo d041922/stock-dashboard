@@ -793,33 +793,152 @@ def get_peer_summary(ticker_list):
         except: continue
     return pd.DataFrame(summary_data)
 
-@st.cache_data(ttl=300) # 5분마다 데이터 갱신
-@st.cache_data(ttl=300) # 5분마다 데이터 갱신
+
+# --- [MOD v35.5 Start] 함수가 '전체 이력 데이터'를 함께 반환하도록 수정 ---
+@st.cache_data(ttl=300)
 def get_market_status_data():
-    """(안정화 버전) 주요 시장 지수 및 거시 경제 지표 데이터를 개별 호출하여 안정성을 높입니다."""
+    """(추세 분석용) 주요 지표, 뉴스, 그리고 '5일 전체 이력 데이터'를 함께 반환합니다."""
     data = {}
     tickers = {
         "S&P 500": "^GSPC", "Nasdaq": "^IXIC", "KOSPI": "^KS11",
-        "VIX": "^VIX", "US 10Y": "^TNX"
+        "VIX": "^VIX", "US 10Y": "^TNX", "Dollar": "DX-Y.NYB", "Crude Oil": "CL=F", "Gold": "GC=F"
     }
     
-    for name, ticker_symbol in tickers.items():
-        try:
-            hist = yf.Ticker(ticker_symbol).history(period="5d")
-            if len(hist) < 2: continue
-            price = hist['Close'].iloc[-1]
-            change = hist['Close'].iloc[-1] - hist['Close'].iloc[-2]
-            change_percent = (change / hist['Close'].iloc[-2]) * 100
-            data[name] = {"price": price, "change": change, "change_percent": change_percent}
-        except Exception:
-            data[name] = {"price": "N/A", "change": "N/A", "change_percent": "N/A"} # 실패 시 N/A 처리
+    hist_data = pd.DataFrame() # 기본 빈 데이터프레임으로 초기화
+    try:
+        hist_data = yf.download(list(tickers.values()), period="5d", progress=False)
+        if not hist_data.empty:
+            for name, ticker_symbol in tickers.items():
+                try:
+                    ticker_series = hist_data['Close'][ticker_symbol].dropna()
+                    if len(ticker_series) >= 2:
+                        price = ticker_series.iloc[-1]
+                        change = price - ticker_series.iloc[-2]
+                        change_percent = (change / ticker_series.iloc[-2]) * 100 if ticker_series.iloc[-2] != 0 else 0
+                        data[name] = {"price": price, "change": change, "change_percent": change_percent}
+                    elif len(ticker_series) == 1:
+                        data[name] = {"price": ticker_series.iloc[-1], "change": "N/A", "change_percent": "N/A"}
+                    else:
+                        data[name] = {"price": "N/A", "change": "N/A", "change_percent": "N/A"}
+                except (KeyError, IndexError):
+                    data[name] = {"price": "N/A", "change": "N/A", "change_percent": "N/A"}
+    except Exception:
+        for name in tickers.keys():
+            data[name] = {"price": "N/A", "change": "N/A", "change_percent": "N/A"}
 
     try:
-        data['news'] = finnhub_client.general_news('general', min_id=0)
+        data['news'] = finnhub_client.general_news('general', min_id=0)[:5]
     except Exception:
         data['news'] = []
 
-    return data
+    return data, hist_data # 요약 데이터와 전체 이력 데이터를 함께 반환
+# --- [MOD v35.5 End] ---
+
+
+# --- [MOD v35.7 Start] AI 브리핑에 '섹터 분석' 추가 및 '요약' 기능 강화 ---
+def generate_market_health_briefing(market_data, full_hist_data, sector_perf_df):
+    """
+    시장/추세/섹터/뉴스를 종합 분석하고, '한 문장 요약'을 포함한 최종 브리핑을 생성합니다.
+    """
+    model = get_gem_core_ai()
+    
+    tickers = {
+        "S&P 500": "^GSPC", "Nasdaq": "^IXIC", "KOSPI": "^KS11",
+        "VIX": "^VIX", "US 10Y": "^TNX", "Dollar": "DX-Y.NYB", "Crude Oil": "CL=F", "Gold": "GC=F"
+    }
+
+    # 지표 및 추세 요약
+    data_summary = []
+    for name, values in market_data.items():
+        if name == 'news': continue
+        price = values.get('price', 'N/A')
+        change_percent = values.get('change_percent', 'N/A')
+        trend = "횡보"
+        try:
+            ticker_symbol = tickers.get(name)
+            if ticker_symbol and not full_hist_data.empty:
+                series = full_hist_data['Close'][ticker_symbol].dropna()
+                if len(series) >= 5:
+                    if series.iloc[-1] > series.iloc[0] * 1.01: trend = "상승 추세"
+                    elif series.iloc[-1] < series.iloc[0] * 0.99: trend = "하락 추세"
+        except (KeyError, IndexError, TypeError):
+            trend = "판단 불가"
+        if isinstance(price, (int, float)) and isinstance(change_percent, (int, float)):
+            data_summary.append(f"- {name}: {price:.2f} ({change_percent:+.2f}%) | 5일 추세: {trend}")
+    data_summary_text = "\n".join(data_summary)
+    
+    # 뉴스 및 섹터 데이터 요약
+    news_headlines = [f"- {news['headline']}" for news in market_data.get('news', [])]
+    news_summary_text = "\n".join(news_headlines) if news_headlines else "최신 주요 뉴스 없음"
+    sector_summary_text = sector_perf_df.to_string(index=False) if not sector_perf_df.empty else "섹터 데이터 없음"
+
+    prompt = f"""
+    **SYSTEM ROLE:** 당신은 월스트리트의 수석 시장 전략가 'GEM: Finance'다. 당신의 임무는 모든 데이터를 연결하여 피상적인 현상 너머의 진실을 파악하고, 바쁜 의사결정자를 위해 핵심을 요약하는 것이다.
+
+    **INPUT DATA:**
+    1. 최신 시장 지표 및 5일 추세:
+    {data_summary_text}
+    2. 최신 경제 뉴스 헤드라인:
+    {news_summary_text}
+    3. 최근 5일간 섹터별 자금 흐름(수익률):
+    {sector_summary_text}
+
+    **MISSION:**
+    1.  **통합 분석:** 위 3가지 데이터를 모두 연결하여 시장의 종합적인 상태를 분석하라. 특히, 거시 지표와 섹터별 자금 흐름 사이의 '일치점' 또는 '불일치점'을 찾아내야 한다.
+    2.  **최종 브리핑 생성:** 아래 지정된 형식에 맞춰, 당신의 깊이 있는 분석을 담은 최종 브리핑을 생성하라.
+    3.  **✨ [중요] 한 문장 요약:** 전체 분석의 핵심 결론을 맨 첫 줄에 `[요약]` 태그를 붙여 한 문장으로 제시하라.
+
+    **OUTPUT FORMAT:**
+    [요약] (모든 분석을 압축한 가장 중요한 핵심 결론 한 문장)
+
+    💡 **AI 시장 종합 진단**
+    * **강세 요인 (Bullish Factors):** (긍정적 지표, 추세, 뉴스, 섹터 흐름 요약)
+    * **약세 요인 (Bearish Factors):** (부정적 지표, 추세, 뉴스, 섹터 흐름 요약)
+    * **핵심 인사이트:** (지표와 섹터 흐름 등을 종합 분석하여 발견한 가장 중요한 '일치점' 또는 '모순점'에 대한 해석)
+    * **종합 코멘트:** (현재 시장 국면에 대한 최종적인 논평)
+    """
+
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"[요약] AI 브리핑 생성 중 오류가 발생했습니다.\n\n오류: {e}"
+# --- [MOD v35.7 End] ---
+
+
+# --- [MOD v35.6 Start] 섹터 성과 데이터 수집 함수 ---
+@st.cache_data(ttl=1800) # 30분마다 데이터 갱신
+def get_sector_performance():
+    """11개 주요 섹터 ETF의 최근 5일간의 성과를 다운로드하여 반환합니다."""
+    sector_tickers = {
+        'Technology': 'XLK', 'Health Care': 'XLV', 'Financials': 'XLF',
+        'Consumer Discretionary': 'XLY', 'Communication Services': 'XLC', 'Industrials': 'XLI',
+        'Consumer Staples': 'XLP', 'Energy': 'XLE', 'Utilities': 'XLU',
+        'Real Estate': 'XLRE', 'Materials': 'XLB'
+    }
+    try:
+        data = yf.download(list(sector_tickers.values()), period="5d", progress=False)
+        if data.empty:
+            return pd.DataFrame()
+        
+        performance = {}
+        for sector, ticker in sector_tickers.items():
+            series = data['Close'][ticker].dropna()
+            if len(series) >= 2:
+                # 5일간의 누적 수익률 계산
+                perf = (series.iloc[-1] / series.iloc[0] - 1) * 100
+                performance[sector] = perf
+        
+        if not performance:
+            return pd.DataFrame()
+
+        perf_df = pd.DataFrame(list(performance.items()), columns=['Sector', 'Performance_5D'])
+        return perf_df
+
+    except Exception:
+        return pd.DataFrame()
+# --- [MOD v35.6 End] ---
+
 
 
 # [신규] 다른 모든 데이터 함수에 대한 허브 경유 함수들
@@ -1073,7 +1192,7 @@ st.caption("v34.0 - Final Strategy Implemented")
 # [수정] 모든 세션 상태를 여기서 한 번에 초기화
 if "data_loaded" not in st.session_state:
     st.session_state.data_loaded = False
-    st.session_state.active_view = "💼 포트폴리오" # 기본 뷰를 여기서 명시적으로 설정
+    st.session_state.active_view = "🔭 시장 건강 상태"
     st.session_state.data_hub = {}
     # ... 기타 초기화 필요한 session_state ...
 
@@ -1237,39 +1356,97 @@ elif st.session_state.active_view == "📡 레이더":
         else:
             st.error("레이더 데이터를 가져오는 데 실패했습니다.")
 
+elif st.session_state.active_view == "🔭 시장 건강 상태":
+    st.header("🔭 Market Health Dashboard")
 
-# --- [수정] 시장 현황 뷰 ---
-elif st.session_state.active_view == "📈 시장 현황":
-    st.header("📈 Market Dashboard")
+    # --- [MOD v35.1 Start] AI 응답 처리 로직 강화 ---
+    with st.spinner("AI가 시장 건강 상태 및 자금 흐름을 종합 분석 중입니다..."):
+        market_data, hist_data = get_market_status_data()
+        sector_perf_df = get_sector_performance() # 섹터 데이터 호출
+        
+        hub_key = "market_briefing_v2" # 프롬프트가 변경되었으므로 캐시 키 변경
+        now = datetime.now()
+        
+        if hub_key in st.session_state.data_hub and (now - st.session_state.data_hub[hub_key][1]) < timedelta(minutes=5):
+            briefing_text = st.session_state.data_hub[hub_key][0]
+        else:
+            # AI 브리핑 함수에 sector_perf_df도 함께 전달
+            briefing_text = generate_market_health_briefing(market_data, hist_data, sector_perf_df)
+            st.session_state.data_hub[hub_key] = (briefing_text, now)
+
+    # --- [MOD v35.7 Start] 요약과 전문 분리 표시 ---
+    summary = ""
+    full_report = ""
+    if briefing_text:
+        # 응답 텍스트를 줄바꿈 기준으로 분리
+        parts = briefing_text.split('\n', 1)
+        # 첫 줄이 [요약] 태그를 포함하는지 확인
+        if parts[0].startswith("[요약]"):
+            summary = parts[0].replace("[요약]", "").strip()
+            full_report = parts[1].strip() if len(parts) > 1 else ""
+        else:
+            # [요약] 태그가 없는 경우, 전체를 전문으로 간주
+            summary = "요약을 생성하지 못했습니다."
+            full_report = briefing_text
+
+    # 요약본을 먼저 표시
+    st.subheader("💡 AI 종합 진단 요약")
+    st.info(summary)
     
-    market_data = get_market_status_data()
+    # 전문은 Expander 안에 표시
+    with st.expander("상세 분석 리포트 보기"):
+        if full_report:
+            st.markdown(full_report)
+        else:
+            st.warning("상세 리포트 내용이 없습니다.")
+    # --- [MOD v35.7 End] ---
 
     if market_data:
-        st.subheader("주요 시장 지수")
-        cols = st.columns(5)
-        indices = ["S&P 500", "Nasdaq", "KOSPI", "VIX", "US 10Y"]
-        for i, name in enumerate(indices):
-            if name in market_data:
-                d = market_data[name]
-                # VIX와 금리는 %가 아니므로 delta 포맷을 다르게 적용
-                if name in ["VIX", "US 10Y"]:
-                     cols[i].metric(
-                        label=name,
-                        value=f"{d['price']:.2f}",
-                        delta=f"{d['change']:.2f}"
-                    )
-                else:
-                    cols[i].metric(
-                        label=name,
-                        value=f"{d['price']:,.2f}",
-                        delta=f"{d['change']:,.2f} ({d['change_percent']:.2f}%)"
-                    )
-        
         st.divider()
+        st.subheader("주요 시장 지수")
         
+        cols = st.columns(8)
+        indices = ["S&P 500", "Nasdaq", "KOSPI", "VIX", "US 10Y", "Dollar", "Crude Oil", "Gold"]
+        
+        for i, name in enumerate(indices):
+            if name in market_data and market_data[name]["price"] != "N/A":
+                d = market_data[name]
+                if name in ["VIX", "US 10Y", "Dollar", "Crude Oil", "Gold"]:
+                    cols[i].metric(label=name, value=f"{d['price']:.2f}", delta=f"{d['change']:.2f}")
+                else:
+                    cols[i].metric(label=name, value=f"{d['price']:,.2f}", delta=f"{d['change']:,.2f} ({d['change_percent']:.2f}%)")
+
+        st.divider()
+
+        # --- [MOD v35.6 Start] 섹터 히트맵 표시 ---
+        st.divider()
+        st.subheader("주요 섹터 자금 흐름 (5일 누적)")
+        
+        sector_perf_df = get_sector_performance()
+        
+        if not sector_perf_df.empty:
+            # [수정] Treemap의 'values'가 항상 양수이도록 절대값을 사용합니다.
+            # 이렇게 하면 타일의 '크기'는 변화의 크기를, '색상'은 상승/하락을 나타냅니다.
+            fig = px.treemap(sector_perf_df, 
+                            path=[px.Constant("S&P 500 Sectors"), 'Sector'], 
+                            values=sector_perf_df['Performance_5D'].abs(), # <-- 핵심 수정
+                            color='Performance_5D',
+                            color_continuous_scale=['#d65f5f', 'lightgray', '#5fba7d'], # Red-Gray-Green
+                            color_continuous_midpoint=0,
+                            custom_data=['Performance_5D']) # 툴팁 및 텍스트 표시용 원본 데이터
+
+            # 타일 위에 섹터 이름과 실제 수익률(%)을 정확히 표시
+            fig.update_traces(texttemplate='%{label}<br>%{customdata[0]:.2f}%')
+            
+            fig.update_layout(margin=dict(t=25, l=0, r=0, b=0)) # 상단 여백 추가
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("섹터 성과 데이터를 가져오는 데 실패했습니다.")
+        # --- [MOD v35.6 End] ---
+
         st.subheader("주요 경제 뉴스")
         if market_data.get('news'):
-            for item in market_data['news'][:5]:
+            for item in market_data['news']:
                 news_date = datetime.fromtimestamp(item['datetime']).strftime('%Y-%m-%d')
                 st.markdown(f"**[{item['headline']}]({item['url']})** - *{news_date}, {item['source']}*")
         else:
@@ -1611,14 +1788,14 @@ elif st.session_state.active_view == "🔍 상세 분석":
         
 with st.sidebar:
     st.header("Controls")
-    view_options = ["💼 포트폴리오", "📡 레이더", "📈 시장 현황", "📡 탐색", "🔍 상세 분석"]
+    view_options = ["🔭 시장 건강 상태", "💼 포트폴리오", "📡 레이더", "📡 탐색", "🔍 상세 분석"] #<-- 이렇게 변경
     
     # st.radio의 현재 선택값을 selected_view 변수에 저장
     selected_view = st.radio(
         "Select View", 
         view_options, 
         index=view_options.index(st.session_state.active_view), 
-        horizontal=True,
+        #horizontal=True,
         key="view_selector"
     )
     
