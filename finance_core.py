@@ -19,6 +19,7 @@ from googleapiclient.http import MediaIoBaseDownload
 import tempfile # <-- 이 라인을 추가
 import os       # <-- 이 라인을 추가
 from PyPDF2 import PdfReader
+from fredapi import Fred # 파일 상단 import 부분에 추가
 
 
 # --- 1. 초기 설정 및 로그인 ---
@@ -794,65 +795,155 @@ def get_peer_summary(ticker_list):
     return pd.DataFrame(summary_data)
 
 
-# --- [MOD v35.5 Start] 함수가 '전체 이력 데이터'를 함께 반환하도록 수정 ---
+# --- [MOD v39.1 Start] 데이터 수집 로직 안정성 복원 및 개선 (최종) ---
 @st.cache_data(ttl=300)
 def get_market_status_data():
-    """(추세 분석용) 주요 지표, 뉴스, 그리고 '5일 전체 이력 데이터'를 함께 반환합니다."""
+    """[최종 안정화 버전] 각 지표의 '최종 업데이트 날짜'를 함께 반환합니다."""
     data = {}
     tickers = {
-        "S&P 500": "^GSPC", "Nasdaq": "^IXIC", "KOSPI": "^KS11",
-        "VIX": "^VIX", "US 10Y": "^TNX", "Dollar": "DX-Y.NYB", "Crude Oil": "CL=F", "Gold": "GC=F"
+        "S&P 500": "^GSPC", "Nasdaq": "^IXIC", "KOSPI": "^KS11", "VIX": "^VIX", 
+        "US 10Y": "^TNX", "Dollar": "DX-Y.NYB", "Crude Oil": "CL=F", 
+        "Gold": "GC=F", "USD/KRW": "USDKRW=X"
     }
     
-    hist_data = pd.DataFrame() # 기본 빈 데이터프레임으로 초기화
+    hist_data = pd.DataFrame() 
     try:
-        hist_data = yf.download(list(tickers.values()), period="5d", progress=False)
+        # 1. 모든 티커 데이터를 한 번에 효율적으로 다운로드
+        hist_data = yf.download(list(tickers.values()), period="6d", progress=False)
+        
         if not hist_data.empty:
             for name, ticker_symbol in tickers.items():
                 try:
+                    # 2. 각 티커별로 데이터 시리즈를 추출하고, 비어있는 값(NaN) 제거
                     ticker_series = hist_data['Close'][ticker_symbol].dropna()
+                    
+                    if ticker_series.empty:
+                        data[name] = {"price": "N/A", "change": "N/A", "change_percent": "N/A", "last_update": "N/A"}
+                        continue
+
+                    # 3. 데이터의 마지막 날짜를 'last_update'로 추출
+                    last_update_date = ticker_series.index[-1].strftime('%Y-%m-%d')
+                    
+                    # 4. 등락률 계산
                     if len(ticker_series) >= 2:
                         price = ticker_series.iloc[-1]
                         change = price - ticker_series.iloc[-2]
                         change_percent = (change / ticker_series.iloc[-2]) * 100 if ticker_series.iloc[-2] != 0 else 0
-                        data[name] = {"price": price, "change": change, "change_percent": change_percent}
+                        data[name] = {"price": price, "change": change, "change_percent": change_percent, "last_update": last_update_date}
                     elif len(ticker_series) == 1:
-                        data[name] = {"price": ticker_series.iloc[-1], "change": "N/A", "change_percent": "N/A"}
-                    else:
-                        data[name] = {"price": "N/A", "change": "N/A", "change_percent": "N/A"}
+                        data[name] = {"price": ticker_series.iloc[-1], "change": "N/A", "change_percent": "N/A", "last_update": last_update_date}
                 except (KeyError, IndexError):
-                    data[name] = {"price": "N/A", "change": "N/A", "change_percent": "N/A"}
+                    data[name] = {"price": "N/A", "change": "N/A", "change_percent": "N/A", "last_update": "N/A"}
     except Exception:
         for name in tickers.keys():
-            data[name] = {"price": "N/A", "change": "N/A", "change_percent": "N/A"}
+            data[name] = {"price": "N/A", "change": "N/A", "change_percent": "N/A", "last_update": "N/A"}
 
     try:
         data['news'] = finnhub_client.general_news('general', min_id=0)[:5]
     except Exception:
         data['news'] = []
+        
+    return data, hist_data
+# --- [MOD v39.1 End] ---
 
-    return data, hist_data # 요약 데이터와 전체 이력 데이터를 함께 반환
-# --- [MOD v35.5 End] ---
+
+# --- [MOD v38 Start] 테마 ETF에 '추세 분석' 기능 추가 ---
+@st.cache_data(ttl=300)
+def get_theme_etf_performance():
+    """선정된 12개 ETF의 '당일 성과'와 '5일 추세'를 함께 반환합니다."""
+    etf_tickers = {
+        "S&P 500": "SPY", "가치주": "VTV", "성장주": "VUG", "반도체": "SOXX", 
+        "AI": "AIQ", "로보틱스": "BOTZ", "바이오테크": "IBB", "차세대 전력": "GRID",
+        "고배당": "SCHD", "장기채": "TLT", "혁신기술": "ARKK", "비트코인": "IBIT"
+    }
+    try:
+        # 5일 추세 계산을 위해 6일치 데이터 요청
+        data = yf.download(list(etf_tickers.values()), period="6d", progress=False)
+        if data.empty: return {}
+        
+        performance = {}
+        for theme, ticker in etf_tickers.items():
+            series = data['Close'][ticker].dropna()
+            if len(series) >= 2:
+                # 당일 등락률
+                change_percent = (series.iloc[-1] / series.iloc[-2] - 1) * 100
+                
+                # 5일 추세
+                trend = "횡보"
+                if len(series) >= 6: # 5일 추세를 보려면 최소 6일 데이터 필요
+                    if series.iloc[-1] > series.iloc[-2] * 1.01: trend = "상승"
+                    elif series.iloc[-1] < series.iloc[-2] * 0.99: trend = "하락"
+
+                performance[theme] = {'change_percent': change_percent, 'trend': trend}
+        return performance
+    except Exception:
+        return {}
+# --- [MOD v38 End] ---
 
 
-# --- [MOD v35.7 Start] AI 브리핑에 '섹터 분석' 추가 및 '요약' 기능 강화 ---
-def generate_market_health_briefing(market_data, full_hist_data, sector_perf_df):
+# --- [MOD v41 Start] 이벤트 캘린더 데이터 수집 함수 ---
+@st.cache_data(ttl=3600) # 1시간마다 갱신
+def get_economic_calendar():
+    """Finnhub API를 사용하여 향후 2주간의 주요 거시 경제 이벤트를 가져옵니다."""
+    try:
+        today = datetime.now().strftime('%Y-%m-%d')
+        two_weeks_later = (datetime.now() + timedelta(days=14)).strftime('%Y-%m-%d')
+        calendar = finnhub_client.economic_calendar(_from=today, to=two_weeks_later)
+        if calendar and calendar.get('economicCalendar'):
+            us_events = [
+                event for event in calendar['economicCalendar'] 
+                if event.get('country') == 'US' and event.get('impact') in ['high', 'medium']
+            ]
+            return sorted(us_events, key=lambda x: x['time'])
+    except Exception:
+        return []
+    return []
+
+@st.cache_data(ttl=3600) # 1시간마다 갱신
+def get_portfolio_earnings_calendar(tickers):
+    """입력된 티커 리스트에 대해 향후 2주간의 실적 발표일을 가져옵니다."""
+    all_earnings = []
+    today = datetime.now().strftime('%Y-%m-%d')
+    two_weeks_later = (datetime.now() + timedelta(days=14)).strftime('%Y-%m-%d')
+    try:
+        # Finnhub API는 한 번에 여러 티커 조회를 지원하지 않으므로 개별 호출
+        for ticker in tickers:
+            calendar = finnhub_client.earnings_calendar(
+                _from=today, to=two_weeks_later, symbol=ticker
+            )
+            if calendar and calendar.get('earningsCalendar'):
+                for earning in calendar['earningsCalendar']:
+                    earning['ticker'] = ticker # 결과에 티커 정보 추가
+                    all_earnings.append(earning)
+        return sorted(all_earnings, key=lambda x: x['date'])
+    except Exception:
+        return []
+# --- [MOD v41 End] ---
+
+
+
+# --- [MOD v38.1 Start] AI 프롬프트 데이터 참조 오류 수정 및 구조 개선 (최종) ---
+def generate_market_health_briefing(market_data, full_hist_data, sector_perf_df, theme_perf, combined_events, eco_indicators): # buffett_data 인수 제거
+
+
     """
-    시장/추세/섹터/뉴스를 종합 분석하고, '한 문장 요약'을 포함한 최종 브리핑을 생성합니다.
+    [최종 수정본] 모든 데이터를 AI 프롬프트에 '직접' 주입하고,
+    '절대 규칙'을 부여하여 데이터 기반의 'JSON' 응답을 생성합니다.
     """
     model = get_gem_core_ai()
-    
-    tickers = {
-        "S&P 500": "^GSPC", "Nasdaq": "^IXIC", "KOSPI": "^KS11",
-        "VIX": "^VIX", "US 10Y": "^TNX", "Dollar": "DX-Y.NYB", "Crude Oil": "CL=F", "Gold": "GC=F"
-    }
+    generation_config = genai.types.GenerationConfig(response_mime_type="application/json")
 
-    # 지표 및 추세 요약
-    data_summary = []
+    # --- 데이터 요약 부분 (이전과 동일) ---
+    tickers = {
+        "S&P 500": "^GSPC", "Nasdaq": "^IXIC", "KOSPI": "^KS11", "VIX": "^VIX", 
+        "US 10Y": "^TNX", "Dollar": "DX-Y.NYB", "Crude Oil": "CL=F", 
+        "Gold": "GC=F", "USD/KRW": "USDKRW=X"
+    }
+    data_summary_items, news_summary_items, sector_summary_items, theme_summary_items = [], [], [], []
+    
     for name, values in market_data.items():
         if name == 'news': continue
-        price = values.get('price', 'N/A')
-        change_percent = values.get('change_percent', 'N/A')
+        price, change_percent = values.get('price', 'N/A'), values.get('change_percent', 'N/A')
         trend = "횡보"
         try:
             ticker_symbol = tickers.get(name)
@@ -861,19 +952,58 @@ def generate_market_health_briefing(market_data, full_hist_data, sector_perf_df)
                 if len(series) >= 5:
                     if series.iloc[-1] > series.iloc[0] * 1.01: trend = "상승 추세"
                     elif series.iloc[-1] < series.iloc[0] * 0.99: trend = "하락 추세"
-        except (KeyError, IndexError, TypeError):
-            trend = "판단 불가"
+        except (KeyError, IndexError, TypeError): trend = "판단 불가"
+        last_update = values.get('last_update', 'N/A')
         if isinstance(price, (int, float)) and isinstance(change_percent, (int, float)):
-            data_summary.append(f"- {name}: {price:.2f} ({change_percent:+.2f}%) | 5일 추세: {trend}")
-    data_summary_text = "\n".join(data_summary)
+            data_summary_items.append(f"- {name}: {price:.2f} ({change_percent:+.2f}%) | 5일 추세: {trend} | 최종 업데이트: {last_update}")
     
-    # 뉴스 및 섹터 데이터 요약
-    news_headlines = [f"- {news['headline']}" for news in market_data.get('news', [])]
-    news_summary_text = "\n".join(news_headlines) if news_headlines else "최신 주요 뉴스 없음"
-    sector_summary_text = sector_perf_df.to_string(index=False) if not sector_perf_df.empty else "섹터 데이터 없음"
+    news_summary_items = [f"- {news['headline']}" for news in market_data.get('news', [])]
+    sector_summary_items = [f"- {row['Sector']}: {row['Performance_5D']:.2f}%" for index, row in sector_perf_df.iterrows()]
+    
+    for theme, perf_data in theme_perf.items():
+        change = perf_data.get('change_percent', 0)
+        trend = perf_data.get('trend', 'N/A')
+        theme_summary_items.append(f"- {theme}: {change:+.2f}% | 5일 추세: {trend}")
 
+    data_summary_text = "\n".join(data_summary_items) if data_summary_items else "데이터 없음"
+    news_summary_text = "\n".join(news_summary_items) if news_summary_items else "최신 주요 뉴스 없음"
+    sector_summary_text = "\n".join(sector_summary_items) if sector_summary_items else "섹터 데이터 없음"
+    theme_summary_text = "\n".join(theme_summary_items) if theme_summary_items else "테마 ETF 데이터 없음"
+
+    # [추가] 이벤트 데이터 요약
+    event_summary_items = []
+    for event in combined_events[:5]: # 상위 5개 이벤트만 요약
+        event_date = datetime.strptime(event['date'], '%Y-%m-%d').strftime('%m/%d')
+        if event['type'] == 'eco':
+            event_summary_items.append(f"- {event_date}: {event['data']['event']}")
+        elif event['type'] == 'earn':
+            event_summary_items.append(f"- {event_date}: ${event['data']['ticker']} 실적발표")
+    event_summary_text = "\n".join(event_summary_items) if event_summary_items else "향후 2주 내 주요 이벤트 없음"
+
+
+    # [고도화] 경제 지표 요약 시, 시계열 데이터를 문자열로 변환하여 추가
+    eco_summary_items = []
+    if eco_indicators:
+        for name, data in eco_indicators.items():
+            # AI에게 12개월 시계열 데이터를 명확하게 전달
+            timeseries_str = ", ".join(map(str, data.get('timeseries', [])))
+            eco_summary_items.append(f"- {name} ({data['type']}): {data['value']:.2f} | 상태: {data['status']} | 12개월 추이: [{timeseries_str}]")
+    eco_summary_text = "\n".join(eco_summary_items) if eco_summary_items else "데이터 없음"
+    
+    # --- 데이터 요약 끝 ---
+    
+    # ✨ --- [핵심 수정] 프롬프트 내부의 예시 문구 및 구조 개선 --- ✨
     prompt = f"""
-    **SYSTEM ROLE:** 당신은 월스트리트의 수석 시장 전략가 'GEM: Finance'다. 당신의 임무는 모든 데이터를 연결하여 피상적인 현상 너머의 진실을 파악하고, 바쁜 의사결정자를 위해 핵심을 요약하는 것이다.
+    **SYSTEM ROLE:** 당신은 월스트리트의 수석 시장 전략가 'GEM: Finance'다. 당신의 임무는 데이터를 기반으로 객관적인 진실만을 보고하는 것이다.
+
+    ---
+    **## ✨ 절대 규칙 (Absolute Rules) ##**
+    1.  **데이터 절대주의:** 너의 모든 분석은 **오직 'INPUT DATA'에 제시된 숫자와 사실에만 기반**해야 한다.
+    2.  **수치 인용 의무:** 주장을 증명하기 위해 **반드시 해당 수치를 괄호 안에 함께 제시**해야 한다. (예: '성장주({theme_perf.get('성장주', {}).get('change_percent', 0):.2f}%)는 가치주({theme_perf.get('가치주', {}).get('change_percent', 0):.2f}%) 대비 부진했습니다.')
+    3.  **창작 금지:** **사실을 만들어내지 마라.** 데이터가 특정 내러티브와 다르다면, 그 '다름' 자체를 분석하라.
+    4.  **시점 분석 (Timing Analysis):** 각 지표의 **'최종 업데이트'** 날짜를 반드시 확인하라. 만약 특정 지표의 날짜가 다른 지표들보다 과거에 멈춰있다면(예: 휴장일), 이를 '독자적 강세/약세'로 성급하게 해석해서는 안 된다. 대신, **'시점 불일치'**가 발생했음을 명확히 지적하고, 그로 인해 분석에 어떤 한계가 있는지 설명하라.
+    5. **시계열 분석 의무:** **'핵심 경제 지표' 분석 시, 반드시 '12개월 추이' 숫자 데이터를 사용하여 추세(상승/하락/횡보)를 심층 분석**하고, 그 추세가 시장에 미치는 영향을 해석해야 한다. (예: '실업률(4.30) 자체는 낮지만, 12개월 추이가 [3.8, ..., 4.3]으로 꾸준히 상승하고 있어 고용 시장의 점진적인 둔화를 시사한다.'
+    ---
 
     **INPUT DATA:**
     1. 최신 시장 지표 및 5일 추세:
@@ -882,28 +1012,37 @@ def generate_market_health_briefing(market_data, full_hist_data, sector_perf_df)
     {news_summary_text}
     3. 최근 5일간 섹터별 자금 흐름(수익률):
     {sector_summary_text}
+    4. 실시간 테마 & 자산군별 성과 및 '5일 추세':
+    {theme_summary_text}
+    5. 향후 2주 내 주요 이벤트:
+    {event_summary_text}
+    6. 핵심 경제 지표 (수치 | 상태 | 12개월 추이):
+    {eco_summary_text}
+
+    
 
     **MISSION:**
-    1.  **통합 분석:** 위 3가지 데이터를 모두 연결하여 시장의 종합적인 상태를 분석하라. 특히, 거시 지표와 섹터별 자금 흐름 사이의 '일치점' 또는 '불일치점'을 찾아내야 한다.
-    2.  **최종 브리핑 생성:** 아래 지정된 형식에 맞춰, 당신의 깊이 있는 분석을 담은 최종 브리핑을 생성하라.
-    3.  **✨ [중요] 한 문장 요약:** 전체 분석의 핵심 결론을 맨 첫 줄에 `[요약]` 태그를 붙여 한 문장으로 제시하라.
+    위 '절대 규칙'을 반드시 준수하여, 모든 입력 데이터를 종합 분석하고 아래 JSON 형식에 맞춰 '요약'과 '상세 리포트'를 생성하라. 'report' 필드의 내용은 마크다운(Markdown) 형식으로 작성해야 한다.
+    ** 7가지 모든 데이터를 종합 분석하라. **특히, 6번 '핵심 경제 지표'의 '12개월 추이'를 심층 분석하여 현재 경제가 확장 국면인지, 둔화 국면인지, 혹은 변곡점에 있는지 진단하라.** 시장의 종합적인 건강 상태를 평가하라.
+    분석 시에는 각 테마의 '당일 성과'와 '5일 추세'를 함께 고려하여 시장의 성격을 심층 분석하라. (예: '반도체(-1.5%)는 오늘 하락했지만 5일 추세는 상승세이므로, 건강한 조정일 수 있다.')
+    ** 현재 시장의 움직임이 5번 '주요 이벤트'를 앞둔 기대감 또는 경계감을 반영하고 있는지 해석하라.
+    모든 입력 데이터를 분석하는 과정에서, 오늘 시장에 의미 있는 영향을 준 모든 '핵심 동인(Key Drivers)'들을 중요도 순으로 찾아내어 분석하라. '핵심 동인'이란, 특정 섹터/테마/자산군의 이례적인 움직임을 유발한 가장 유력한 뉴스나 이벤트를 의미한다.
 
-    **OUTPUT FORMAT:**
-    [요약] (모든 분석을 압축한 가장 중요한 핵심 결론 한 문장)
 
-    💡 **AI 시장 종합 진단**
-    * **강세 요인 (Bullish Factors):** (긍정적 지표, 추세, 뉴스, 섹터 흐름 요약)
-    * **약세 요인 (Bearish Factors):** (부정적 지표, 추세, 뉴스, 섹터 흐름 요약)
-    * **핵심 인사이트:** (지표와 섹터 흐름 등을 종합 분석하여 발견한 가장 중요한 '일치점' 또는 '모순점'에 대한 해석)
-    * **종합 코멘트:** (현재 시장 국면에 대한 최종적인 논평)
+    **OUTPUT JSON FORMAT:**
+    {{
+      "summary": "모든 분석을 압축한 가장 중요한 핵심 결론 한 문장",
+      "report": "💡 **AI 시장 종합 진단**\\n\\n* **시장 현상 (What):** ...\\n* **내부 동력 (Why):** ...\\n* **핵심 인사이트:** ...\\n* **종합 코멘트:** ..."
+    }}
     """
 
     try:
-        response = model.generate_content(prompt)
-        return response.text
+        response = model.generate_content(prompt, generation_config=generation_config)
+        result_json = json.loads(response.text)
+        return result_json
     except Exception as e:
-        return f"[요약] AI 브리핑 생성 중 오류가 발생했습니다.\n\n오류: {e}"
-# --- [MOD v35.7 End] ---
+        return {"summary": "AI 브리핑 생성 중 오류가 발생했습니다.", "report": f"**오류 발생:**\n\n```\n{str(e)}\n```"}
+# --- [MOD v38.1 End] ---
 
 
 # --- [MOD v35.6 Start] 섹터 성과 데이터 수집 함수 ---
@@ -938,6 +1077,119 @@ def get_sector_performance():
     except Exception:
         return pd.DataFrame()
 # --- [MOD v35.6 End] ---
+
+
+# finance_core.py 파일의 get_economic_indicators 함수를 아래 코드로 전체 교체
+
+@st.cache_data(ttl=43200) # 12시간마다 갱신
+def get_economic_indicators():
+    """[최종 고도화] 데이터 길이에 따라 '장기/단기 추세'를 자동으로 선택하여 분석합니다."""
+    
+    indicator_definitions = {
+        "미국 장단기 금리차": {"code": "T10Y2Y", "type": "선행"},
+        "개인소비지출(PCE)": {"code": "PCE", "type": "동행"},
+        "실업률": {"code": "UNRATE", "type": "후행"},
+        "근원 CPI (YoY)": {"code": "CORESTICKM159SFRBATL", "type": "후행"},
+    }
+    try:
+        fred_api_key = st.secrets["FRED_API_KEY"]
+        fred = Fred(api_key=fred_api_key)
+        results = {}
+        start_date = (datetime.now() - timedelta(days=400)).strftime('%Y-%m-%d')
+
+        for name, info in indicator_definitions.items():
+            series = fred.get_series(info['code'], observation_start=start_date)
+            if not series.empty:
+                series_monthly = series.resample('M').last().dropna()
+                
+                # [핵심] 데이터 길이에 따라 유연하게 추세 분석
+                if len(series_monthly) >= 6:
+                    # Case 1: 데이터가 충분하면 장기 추세 분석
+                    avg_recent_3m = series_monthly.iloc[-3:].mean()
+                    avg_prev_3m = series_monthly.iloc[-6:-3].mean()
+                    trend_change = avg_recent_3m - avg_prev_3m
+                    trend_label = "(3mo avg)"
+                elif len(series_monthly) >= 2:
+                    # Case 2: 데이터가 부족하면 단기 추세(MoM) 분석
+                    latest_value_trend = series_monthly.iloc[-1]
+                    prev_value_trend = series_monthly.iloc[-2]
+                    trend_change = latest_value_trend - prev_value_trend
+                    trend_label = "(MoM)"
+                else:
+                    # 추세 분석 불가
+                    trend_change = 0
+                    trend_label = ""
+
+                latest_value = series_monthly.iloc[-1]
+                
+                if trend_change > 0.05: trend_icon = "🔼"
+                elif trend_change < -0.05: trend_icon = "🔽"
+                else: trend_icon = "⏺️"
+                trend_text = f"{trend_icon} {trend_label}"
+
+                # (이하 상태 평가 로직은 이전과 동일)
+                status_text = "중립적 ⚪️"
+                if name == "미국 장단기 금리차":
+                    if latest_value > 0.25: status_text = "긍정적 🟢"
+                    elif latest_value < 0: status_text = "부정적 🔴"
+                # ... (다른 지표들의 상태 평가 로직)
+                
+                results[name] = {
+                    "value": latest_value, "type": info['type'],
+                    "trend": trend_text, "status": status_text,
+                    "timeseries": series_monthly.tail(12).round(2).tolist()
+                }
+        return results
+    except Exception as e:
+        st.warning(f"FRED 경제 지표 로딩 중 오류: {e}")
+        return {}
+
+# [신규 기능] AI 포트폴리오 전략 브리핑 생성 함수
+def generate_portfolio_briefing(summary_df, detail_df):
+    """
+    목표 대비 배분 현황과 개별 종목 상세 현황을 바탕으로
+    AI가 포트폴리오의 종합 진단 및 전략 제안을 생성합니다.
+    """
+    model = get_gem_core_ai()
+
+    # AI에게 전달할 데이터 요약
+    summary_text = summary_df.to_string(index=False)
+    
+    # 건강검진 데이터 중 유의미한 정보만 필터링 (예: RSI > 70 또는 고점대비 < -30%)
+    critical_stocks = detail_df[
+        (detail_df['RSI'] > 70) | (detail_df['고점대비(%)'] < -30)
+    ][['종목명', '자산티어', 'RSI', '고점대비(%)']].copy()
+    critical_text = "현재 특별한 위험/기회 신호를 보이는 개별 종목은 없습니다."
+    if not critical_stocks.empty:
+        critical_text = "아래는 현재 유의미한 신호를 보이는 개별 종목 현황입니다:\n" + critical_stocks.to_string(index=False)
+
+    prompt = f"""
+    **SYSTEM ROLE:** 당신은 투자 전략가 'GEM: Finance'입니다. 당신의 임무는 MASTER의 포트폴리오 데이터를 분석하여, 현재 상태를 명확히 진단하고 다음 행동을 제안하는 것입니다. MASTER의 투자 철학은 '현명한 공격'이며, 비중이 부족한 자산을 저렴하게 매수하고, 과열된 자산은 일부 이익 실현하여 리밸런싱하는 것을 선호합니다.
+
+    **INPUT DATA:**
+    1. 목표 대비 자산 배분 현황:
+    {summary_text}
+
+    2. 주의가 필요한 개별 종목 현황 (RSI 과열 또는 과도한 하락):
+    {critical_text}
+
+    **MISSION:**
+    위 두 가지 데이터를 종합하여, 아래 형식에 맞춰 'AI 포트폴리오 전략 브리핑'을 생성하십시오. 모든 내용은 한국어로 작성해야 합니다.
+
+    ---
+    ### 💡 AI 포트폴리오 전략 브리핑
+
+    * **종합 진단:** (자산 배분 현황을 한 문장으로 요약하고, 개별 종목의 위험/기회 요소를 언급하며 현재 포트폴리오 상태를 진단합니다. 예: '현재 포트폴리오는 코어 비중이 부족한 상태이며, 동시에 핵심 위성 자산인 SMCI가 단기 과열 신호를 보이고 있습니다.')
+
+    * **전략 제안:** (위 진단을 바탕으로 구체적인 리밸런싱 행동 계획을 제안합니다. 어떤 자산을 팔고, 어떤 자산을 사야 하는지 명확하게 제시하십시오. 예: '따라서, 단기 과열 상태인 SMCI의 일부를 이익 실현하고, 확보된 현금으로 비중이 부족한 코어 자산을 추가 매수하여 포트폴리오의 균형을 맞추는 리밸런싱을 고려할 최적의 시점입니다.')
+    ---
+    """
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"**AI 브리핑 생성 중 오류 발생:**\n\n{e}"
+
 
 
 
@@ -1192,7 +1444,7 @@ st.caption("v34.0 - Final Strategy Implemented")
 # [수정] 모든 세션 상태를 여기서 한 번에 초기화
 if "data_loaded" not in st.session_state:
     st.session_state.data_loaded = False
-    st.session_state.active_view = "🔭 시장 건강 상태"
+    st.session_state.active_view = "💼 포트폴리오"
     st.session_state.data_hub = {}
     # ... 기타 초기화 필요한 session_state ...
 
@@ -1203,24 +1455,18 @@ if not st.session_state.data_loaded:
     st.rerun() # 데이터를 로드한 후, 기본 뷰를 제대로 표시하기 위해 한 번 더 재실행
 
 # --- 포트폴리오 뷰 ---
+# --- 포트폴리오 뷰 ---
 elif st.session_state.active_view == "💼 포트폴리오":
     st.header("💼 Portfolio Command Center")
     
     portfolio_df = st.session_state.portfolio_df
     cash_df = st.session_state.cash_df
 
-    if not portfolio_df.empty or not cash_df.empty:
-        # [수정] ETF/국내주식과 개별투자 종목 분리
-        investment_df = portfolio_df[~portfolio_df['종목코드'].str.contains('.KS|.KQ', na=True, regex=True)]
-        
-        # [수정] 개별투자 종목에 대해서만 '일상 건강검진' 수행
-        health_check_df = pd.DataFrame()
-        all_investment_tickers = investment_df['종목코드'].dropna().unique().tolist()
-        if all_investment_tickers:
-            with st.spinner("보유 자산 상태 분석 중... (일상 건강검진 수행)"):
-                health_check_df = get_health_check_data(all_investment_tickers)
+    if not cash_df.empty:
+        cash_df = cash_df[~cash_df['종목명'].str.contains('비상금', na=False)]
 
-        # 기존 포트폴리오 대시보드 생성 (모든 종목 대상)
+    if not portfolio_df.empty or not cash_df.empty:
+        # --- 1. 모든 데이터 준비 및 최종 데이터프레임 생성 ---
         all_tickers_for_price = portfolio_df['종목코드'].dropna().unique().tolist()
         if all_tickers_for_price:
             current_prices, usd_krw_rate = get_current_prices_and_rate(all_tickers_for_price)
@@ -1229,80 +1475,188 @@ elif st.session_state.active_view == "💼 포트폴리오":
         else:
             invest_dashboard_df = pd.DataFrame()
 
-        # [수정] 건강검진 결과와 포트폴리오 데이터를 '종목코드' 기준으로 병합
-        if not health_check_df.empty and not invest_dashboard_df.empty:
-            invest_dashboard_df = pd.merge(invest_dashboard_df, health_check_df, on='종목코드', how='left')
+        health_check_df = pd.DataFrame()
+        if not invest_dashboard_df.empty:
+            all_investment_tickers = invest_dashboard_df['종목코드'].dropna().unique().tolist()
+            if all_investment_tickers:
+                with st.spinner("개별 자산 건강검진 수행 중..."):
+                    health_check_df = get_health_check_data(all_investment_tickers)
+            if not health_check_df.empty:
+                invest_dashboard_df = pd.merge(invest_dashboard_df, health_check_df, on='종목코드', how='left')
 
-        # 현금 자산 처리 (기존 로직 유지)
         cash_dashboard_df = pd.DataFrame()
         if not cash_df.empty:
             cash_dashboard_df = cash_df.rename(columns={'금액(KRW)': '현재 평가 금액 (KRW)'})
-            cash_dashboard_df['수익률 (%)'] = 0
-            cash_dashboard_df['손익 (고유)'] = 0
-            cash_dashboard_df['수량'] = '-'
-            cash_dashboard_df['평균 단가 (고유)'] = '-'
-            cash_dashboard_df['현재가 (고유)'] = '-'
-        
-        # [수정] 표시할 컬럼에 건강검진 결과 추가
-        display_cols = ['계좌구분', '종목명', '자산티어', '수량', '평균 단가 (고유)', '현재가 (고유)', 
-                        '손익 (고유)', '수익률 (%)', '현재 평가 금액 (KRW)', 
-                        '고점대비(%)', 'RSI', '거래량(%)']
-        
-        # 최종 데이터프레임 조립
-        final_dashboard_df = pd.concat([
-            invest_dashboard_df,
-            cash_dashboard_df
-        ], ignore_index=True)
+            cash_dashboard_df['수익률 (%)'] = 0; cash_dashboard_df['손익 (고유)'] = 0; cash_dashboard_df['수량'] = '-';
+            cash_dashboard_df['평균 단가 (고유)'] = '-'; cash_dashboard_df['현재가 (고유)'] = '-';
 
-        # 숫자 컬럼 타입 정리 (건강검진 컬럼 추가)
-        numeric_cols_final = ['손익 (고유)', '수익률 (%)', '현재 평가 금액 (KRW)', '고점대비(%)', 'RSI', '거래량(%)']
-        for col in numeric_cols_final:
-            if col in final_dashboard_df.columns:
-                final_dashboard_df[col] = pd.to_numeric(final_dashboard_df[col], errors='coerce')
+        final_dashboard_df = pd.concat([invest_dashboard_df, cash_dashboard_df], ignore_index=True)
+        
+        final_dashboard_df['계좌구분'] = (
+            final_dashboard_df['계좌구분']
+            .astype(str).str.strip()
+            .replace({'nan': '현금', 'None': '현금', '': '현금'}).str.lower()
+        )
+        final_dashboard_df['계좌구분'] = final_dashboard_df['계좌구분'].replace({
+            'irp': 'IRP', '회사퇴직dc': '회사퇴직DC', 'isa': 'ISA',
+            '해외 직투': '해외 직투', '연금저축': '연금저축', '현금': '현금'
+        })
 
-        # 총 자산 요약 메트릭 (기존 로직 유지)
+        # --- 2. AI 브리핑을 위한 데이터 준비 ---
+        direct_investment_df = final_dashboard_df[final_dashboard_df['계좌구분'] == '해외 직투'].copy()
+        total_direct_investment_value = direct_investment_df['현재 평가 금액 (KRW)'].sum()
+        targets = {"코어 (Tier 1+1.5)": 60.0, "핵심 위성 (Tier 2)": 30.0, "테마형 위성 (Tier 3)": 10.0}
+        summary_df_for_ai = pd.DataFrame()
+
+        if total_direct_investment_value > 0 and '자산티어' in direct_investment_df.columns:
+            core_value = direct_investment_df[direct_investment_df['자산티어'].isin(['Tier 1', 'Tier 1.5'])]['현재 평가 금액 (KRW)'].sum()
+            tier2_value = direct_investment_df[direct_investment_df['자산티어'] == 'Tier 2']['현재 평가 금액 (KRW)'].sum()
+            tier3_value = direct_investment_df[direct_investment_df['자산티어'] == 'Tier 3']['현재 평가 금액 (KRW)'].sum()
+            current_alloc = {
+                "코어 (Tier 1+1.5)": (core_value / total_direct_investment_value) * 100,
+                "핵심 위성 (Tier 2)": (tier2_value / total_direct_investment_value) * 100,
+                "테마형 위성 (Tier 3)": (tier3_value / total_direct_investment_value) * 100,
+            }
+            summary_data_for_ai = []
+            for group, target_pct in targets.items():
+                current_pct = current_alloc.get(group, 0)
+                diff = current_pct - target_pct
+                status = "정상"
+                if diff < -5: status = "부족"
+                elif diff > 5: status = "과다"
+                summary_data_for_ai.append({
+                    "자산 그룹": group, "현재 비중(%)": current_pct, "목표 비중(%)": target_pct,
+                    "차이(%)": diff, "상태 평가": status
+                })
+            summary_df_for_ai = pd.DataFrame(summary_data_for_ai)
+        
+        # --- 3. [신규] AI 포트폴리오 전략 브리핑 표시 ---
+        if not summary_df_for_ai.empty:
+            with st.spinner("AI가 포트폴리오를 분석하고 전략을 제안하는 중..."):
+                briefing = generate_portfolio_briefing(summary_df_for_ai, final_dashboard_df)
+                st.markdown(briefing)
+
+        # --- 2. 계좌별 성과 요약 ---
+        st.subheader("📊 성과 요약")
+
         total_value = final_dashboard_df['현재 평가 금액 (KRW)'].sum()
-        total_cost = invest_dashboard_df['총 매수 금액 (KRW)'].sum() if not invest_dashboard_df.empty else 0
-        total_pl = invest_dashboard_df['손익 (KRW)'].sum() if not invest_dashboard_df.empty else 0
+        total_invest_df = final_dashboard_df[final_dashboard_df['계좌구분'] != '현금']
+        total_cost = total_invest_df['총 매수 금액 (KRW)'].sum() if not total_invest_df.empty else 0
+        total_pl = total_invest_df['손익 (KRW)'].sum() if not total_invest_df.empty else 0
         total_pl_percent = (total_pl / total_cost) * 100 if total_cost > 0 else 0
+        
+        with st.container(border=True):
+            st.markdown("##### 총 자산 (전체 계좌, 비상금 제외)")
+            cols = st.columns(3)
+            cols[0].metric("총 평가 자산", f"₩{total_value:,.0f}")
+            cols[1].metric("총 손익 (투자)", f"₩{total_pl:,.0f}", f"{total_pl_percent:.2f}%")
+            cols[2].metric("총 투자 원금", f"₩{total_cost:,.0f}")
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("총 평가 자산", f"₩{total_value:,.0f}")
-        col2.metric("총 손익 (투자자산)", f"₩{total_pl:,.0f}", f"{total_pl_percent:.2f}%")
-        col3.metric("총 투자 원금", f"₩{total_cost:,.0f}")
+        with st.expander("계좌별 상세 성과 보기", expanded=True):
+            # (이하 로직은 변경 없음, 이제 정상적으로 작동)
+            account_summary_data = []
+            accounts = final_dashboard_df['계좌구분'].unique()
+            for account in accounts:
+                account_df = final_dashboard_df[final_dashboard_df['계좌구분'] == account]
+                account_invest_df = account_df[account_df['계좌구분'] != '현금']
+                acc_total_value = account_df['현재 평가 금액 (KRW)'].sum()
+                acc_total_cost = account_invest_df['총 매수 금액 (KRW)'].sum() if not account_invest_df.empty else 0
+                acc_total_pl = account_invest_df['손익 (KRW)'].sum() if not account_invest_df.empty else 0
+                acc_total_pl_percent = (acc_total_pl / acc_total_cost) * 100 if acc_total_cost > 0 else 0
+                
+                account_summary_data.append({
+                    "계좌 구분": account, "평가 자산": acc_total_value,
+                    "손익": acc_total_pl, "수익률(%)": acc_total_pl_percent,
+                    "투자 원금": acc_total_cost
+                })
+            
+            if account_summary_data:
+                account_summary_df = pd.DataFrame(account_summary_data)
+                account_order = ['해외 직투', 'ISA', '연금저축', 'IRP', '회사퇴직DC', '현금']
+                ordered_categories = [acc for acc in account_order if acc in account_summary_df['계좌 구분'].values]
+                account_summary_df['계좌 구분'] = pd.Categorical(account_summary_df['계좌 구분'], categories=ordered_categories, ordered=True)
+                account_summary_df = account_summary_df.sort_values('계좌 구분').reset_index(drop=True)
+
+                def color_return(val):
+                    color = '#4CAF50' if val > 0 else '#F44336' if val < 0 else '#333333'
+                    return f'color: {color}'
+                
+                st.dataframe(account_summary_df.style.format({
+                                 "평가 자산": "₩{:,.0f}", "손익": "₩{:,.0f}",
+                                 "수익률(%)": "{:,.2f}%", "투자 원금": "₩{:,.0f}"
+                             }).applymap(color_return, subset=['수익률(%)']), 
+                             use_container_width=True)
         st.divider()
 
+        # --- 3. 목표 대비 자산 배분 현황 (해외 직투) ---
+        st.subheader("🎯 목표 대비 자산 배분 현황 (해외 직투)")
+        direct_investment_df = final_dashboard_df[final_dashboard_df['계좌구분'] == '해외 직투'].copy()
+        total_direct_investment_value = direct_investment_df['현재 평가 금액 (KRW)'].sum()
+        targets = {"코어 (Tier 1+1.5)": 60.0, "핵심 위성 (Tier 2)": 30.0, "테마형 위성 (Tier 3)": 10.0}
+
+        if total_direct_investment_value > 0 and '자산티어' in direct_investment_df.columns:
+            core_value = direct_investment_df[direct_investment_df['자산티어'].isin(['Tier 1', 'Tier 1.5'])]['현재 평가 금액 (KRW)'].sum()
+            tier2_value = direct_investment_df[direct_investment_df['자산티어'] == 'Tier 2']['현재 평가 금액 (KRW)'].sum()
+            tier3_value = direct_investment_df[direct_investment_df['자산티어'] == 'Tier 3']['현재 평가 금액 (KRW)'].sum()
+            current_alloc = {
+                "코어 (Tier 1+1.5)": (core_value / total_direct_investment_value) * 100,
+                "핵심 위성 (Tier 2)": (tier2_value / total_direct_investment_value) * 100,
+                "테마형 위성 (Tier 3)": (tier3_value / total_direct_investment_value) * 100,
+            }
+            summary_data = []
+            for group, target_pct in targets.items():
+                current_pct = current_alloc.get(group, 0)
+                diff = current_pct - target_pct
+                status = "🟢 정상"
+                if diff < -5: status = "🔴 부족"
+                elif diff > 5: status = "🟡 과다"
+                summary_data.append({
+                    "자산 그룹": group, "현재 비중(%)": current_pct, "목표 비중(%)": target_pct,
+                    "차이(%)": diff, "상태 평가": status
+                })
+            summary_df = pd.DataFrame(summary_data)
+            def color_status(val):
+                color = 'red' if '부족' in val else 'orange' if '과다' in val else 'green'
+                return f'color: {color}'
+            st.dataframe(summary_df.style
+                         .format({"현재 비중(%)": "{:.1f}%", "목표 비중(%)": "{:.1f}%", "차이(%)": "{:+.1f}%"})
+                         .applymap(color_status, subset=['상태 평가'])
+                         .bar(subset=["현재 비중(%)"], color='lightblue', vmin=0, vmax=100),
+                         use_container_width=True)
+        else:
+            st.warning("'해외 직투' 계좌에 자산이 없거나 '자산티어'가 지정되지 않아 목표 대비 현황을 분석할 수 없습니다.")
+        
+        st.divider()
+        
+         # --- 4. 보유 자산 상세 및 자산 배분 차트 ---
         col1, col2 = st.columns([0.7, 0.3])
         with col1:
-            st.subheader("보유 자산 상세")
+            st.subheader("보유 자산 상세 (전체)")
+            display_cols = ['계좌구분', '종목명', '자산티어', '수량', '평균 단가 (고유)', '현재가 (고유)',  
+                            '손익 (고유)', '수익률 (%)', '현재 평가 금액 (KRW)', 
+                            '고점대비(%)', 'RSI', '거래량(%)']
             
-            # [수정] 데이터프레임 스타일링에 건강검진 결과 포맷 추가
-            formatter = {
-                '손익 (고유)': '{:,.2f}', 
-                '수익률 (%)': '{:.2f}%', 
-                '현재 평가 금액 (KRW)': '₩{:,.0f}',
-                "고점대비(%)": "{:,.2f}%", 
-                "RSI": "{:.1f}", 
-                "거래량(%)": "{:,.0f}%"
-            }
+            formatter = {'손익 (고유)': '{:,.2f}', '수익률 (%)': '{:.2f}%', '현재 평가 금액 (KRW)': '₩{:,.0f}', 
+                         "고점대비(%)": "{:,.2f}%", "RSI": "{:.1f}", "거래량(%)": "{:,.0f}%"}
             
-            df_to_display = final_dashboard_df.reindex(columns=display_cols)
-
-            st.dataframe(df_to_display.style
-                .format(formatter, na_rep="-")
-                .background_gradient(cmap='RdYlGn', subset=['수익률 (%)'])
-                .bar(subset=['고점대비(%)'], color='#FFA07A')
-                .bar(subset=['RSI'], align='mid', color=['#d65f5f', '#5fba7d'])
-                .bar(subset=['거래량(%)'], color='lightblue'), 
-                use_container_width=True
+            # ✨ [핵심 수정] 불필요한 데이터 처리 로직 삭제, 최종 데이터프레임을 바로 사용
+            st.dataframe(final_dashboard_df.style
+                         .format(formatter, na_rep="-")
+                         .background_gradient(cmap='RdYlGn', subset=['수익률 (%)'])
+                         .bar(subset=['고점대비(%)'], color='#FFA07A', vmin=-100, vmax=0)
+                         .bar(subset=['RSI'], align='mid', color=['#d65f5f', '#5fba7d'], vmin=0, vmax=100)
+                         .bar(subset=['거래량(%)'], color='lightblue'), 
+                         use_container_width=True,
+                         column_order=display_cols # 컬럼 순서 지정
             )
         
         with col2:
-            st.subheader("자산 배분")
+            st.subheader("자산 배분 (전체)")
             chart_group_by = st.radio("차트 기준", ['자산티어', '계좌구분'], horizontal=True, key='chart_group')
             filter_cols = st.columns(2)
             exclude_base = filter_cols[0].checkbox("'기반' 티어 제외", value=True)
             exclude_cash = filter_cols[1].checkbox("'현금' 자산 제외", value=True)
+            
             chart_df = final_dashboard_df.copy()
             
             if exclude_base and '자산티어' in chart_df.columns:
@@ -1318,6 +1672,7 @@ elif st.session_state.active_view == "💼 포트폴리오":
                 st.warning("차트에 표시할 데이터가 없습니다.")
     else:
         st.info("Google Sheets에서 포트폴리오 또는 현금 데이터를 불러올 수 없습니다.")
+
 
 # --- [추가] 레이더 뷰 ---
 elif st.session_state.active_view == "📡 레이더":
@@ -1359,91 +1714,195 @@ elif st.session_state.active_view == "📡 레이더":
 elif st.session_state.active_view == "🔭 시장 건강 상태":
     st.header("🔭 Market Health Dashboard")
 
-    # --- [MOD v35.1 Start] AI 응답 처리 로직 강화 ---
-    with st.spinner("AI가 시장 건강 상태 및 자금 흐름을 종합 분석 중입니다..."):
+    # --- 1. 모든 데이터 준비 ---
+    with st.spinner("시장 데이터 및 이벤트 정보를 수집 중..."):
         market_data, hist_data = get_market_status_data()
-        sector_perf_df = get_sector_performance() # 섹터 데이터 호출
+        sector_perf_df = get_sector_performance()
+        theme_perf = get_theme_etf_performance()
+
+        # --- 신규 데이터 로드 ---
+        eco_indicators = get_economic_indicators()
         
-        hub_key = "market_briefing_v2" # 프롬프트가 변경되었으므로 캐시 키 변경
+        # 이벤트 데이터 준비
+        eco_events = get_economic_calendar()
+        portfolio_tickers = st.session_state.portfolio_df['종목코드'].dropna().unique().tolist()
+        watchlist_tickers = st.session_state.watchlist_df['종목코드'].dropna().unique().tolist()
+        all_my_tickers = list(set(portfolio_tickers + watchlist_tickers))
+        earnings_events = get_portfolio_earnings_calendar(all_my_tickers)
+
+        combined_events = []
+        for event in eco_events:
+            combined_events.append({'date': event['time'].split(' ')[0], 'type': 'eco', 'data': event})
+        for event in earnings_events:
+            combined_events.append({'date': event['date'], 'type': 'earn', 'data': event})
+        sorted_events = sorted(combined_events, key=lambda x: x['date'])
+
+    # --- 2. AI 종합 분석 (모든 데이터 준비 완료 후 실행) ---
+    with st.spinner("AI가 시장 건강 상태 및 미래 이벤트를 종합 분석 중입니다..."):
+        hub_key = "market_briefing_v4"
         now = datetime.now()
-        
         if hub_key in st.session_state.data_hub and (now - st.session_state.data_hub[hub_key][1]) < timedelta(minutes=5):
-            briefing_text = st.session_state.data_hub[hub_key][0]
+            briefing_result = st.session_state.data_hub[hub_key][0]
         else:
-            # AI 브리핑 함수에 sector_perf_df도 함께 전달
-            briefing_text = generate_market_health_briefing(market_data, hist_data, sector_perf_df)
-            st.session_state.data_hub[hub_key] = (briefing_text, now)
+            briefing_result = generate_market_health_briefing(market_data, hist_data, sector_perf_df, theme_perf, sorted_events, eco_indicators)
+            st.session_state.data_hub[hub_key] = (briefing_result, now)
 
-    # --- [MOD v35.7 Start] 요약과 전문 분리 표시 ---
-    summary = ""
-    full_report = ""
-    if briefing_text:
-        # 응답 텍스트를 줄바꿈 기준으로 분리
-        parts = briefing_text.split('\n', 1)
-        # 첫 줄이 [요약] 태그를 포함하는지 확인
-        if parts[0].startswith("[요약]"):
-            summary = parts[0].replace("[요약]", "").strip()
-            full_report = parts[1].strip() if len(parts) > 1 else ""
-        else:
-            # [요약] 태그가 없는 경우, 전체를 전문으로 간주
-            summary = "요약을 생성하지 못했습니다."
-            full_report = briefing_text
-
-    # 요약본을 먼저 표시
+    # --- 3. UI 표시 ---
+    # AI 브리핑 표시
+    summary = briefing_result.get("summary", "AI가 요약을 생성하지 못했습니다.")
+    full_report = briefing_result.get("report", "상세 리포트를 생성하지 못했습니다.")
     st.subheader("💡 AI 종합 진단 요약")
     st.info(summary)
-    
-    # 전문은 Expander 안에 표시
     with st.expander("상세 분석 리포트 보기"):
-        if full_report:
-            st.markdown(full_report)
-        else:
-            st.warning("상세 리포트 내용이 없습니다.")
-    # --- [MOD v35.7 End] ---
+        st.markdown(full_report)
+    # --- [MOD v36.6 End] ---
 
     if market_data:
         st.divider()
-        st.subheader("주요 시장 지수")
+
+         # --- [MOD v46 Start] 거시 지표 섹션 UI 재구성 ---
+        st.subheader("🔭 시장 종합 계기판")
+
+        # 2. 핵심 경제 지표 (선행/동행/후행)
+        st.markdown("##### 🔑 핵심 경제 지표")
+
+        eco_indicators = get_economic_indicators()
+        if eco_indicators:
+            cols = st.columns(len(eco_indicators))
+            for i, (name, data) in enumerate(eco_indicators.items()):
+                
+                # [고도화] 상태(status)에 따라 델타 색상 결정
+                delta_color = "off"
+                if "긍정적" in data['status']: delta_color = "normal"
+                elif "부정적" in data['status']: delta_color = "inverse"
+                    
+                cols[i].metric(
+                    label=f"{name} ({data['type']})",
+                    value=f"{data['value']:,.2f}",
+                    delta=f"{data['status']} {data['trend']}", # 상태와 추세를 함께 표시
+                    delta_color=delta_color
+                )
+        else:
+            st.warning("핵심 경제 지표를 불러오는 데 실패했습니다.")
+
         
-        cols = st.columns(8)
-        indices = ["S&P 500", "Nasdaq", "KOSPI", "VIX", "US 10Y", "Dollar", "Crude Oil", "Gold"]
+        st.divider()
         
+        # 1. 거시 경제 지표 섹션 (기존과 동일)
+        st.subheader("🌎 거시 경제 지표")
+        # ... (거시 지표 표시하는 cols, indices, for 루프 등은 이전과 동일하게 유지) ...
+        cols = st.columns(5)
+        indices = ["S&P 500", "Nasdaq", "VIX", "US 10Y", "USD/KRW"]
         for i, name in enumerate(indices):
             if name in market_data and market_data[name]["price"] != "N/A":
                 d = market_data[name]
-                if name in ["VIX", "US 10Y", "Dollar", "Crude Oil", "Gold"]:
-                    cols[i].metric(label=name, value=f"{d['price']:.2f}", delta=f"{d['change']:.2f}")
-                else:
-                    cols[i].metric(label=name, value=f"{d['price']:,.2f}", delta=f"{d['change']:,.2f} ({d['change_percent']:.2f}%)")
+                cols[i].metric(label=name, value=f"{d['price']:,.2f}", delta=f"{d['change']:,.2f} ({d['change_percent']:.2f}%)" if name not in ['VIX', 'US 10Y'] else f"{d['change']:.2f}")
+        cols = st.columns(4)
+        indices = ["Dollar", "Crude Oil", "Gold", "KOSPI"]
+        for i, name in enumerate(indices):
+             if name in market_data and market_data[name]["price"] != "N/A":
+                d = market_data[name]
+                cols[i].metric(label=name, value=f"{d['price']:,.2f}", delta=f"{d['change']:.2f} ({d['change_percent']:.2f}%)" if name not in ['Dollar'] else f"{d['change']:.2f}")
 
         st.divider()
 
-        # --- [MOD v35.6 Start] 섹터 히트맵 표시 ---
-        st.divider()
-        st.subheader("주요 섹터 자금 흐름 (5일 누적)")
-        
-        sector_perf_df = get_sector_performance()
-        
-        if not sector_perf_df.empty:
-            # [수정] Treemap의 'values'가 항상 양수이도록 절대값을 사용합니다.
-            # 이렇게 하면 타일의 '크기'는 변화의 크기를, '색상'은 상승/하락을 나타냅니다.
-            fig = px.treemap(sector_perf_df, 
-                            path=[px.Constant("S&P 500 Sectors"), 'Sector'], 
-                            values=sector_perf_df['Performance_5D'].abs(), # <-- 핵심 수정
-                            color='Performance_5D',
-                            color_continuous_scale=['#d65f5f', 'lightgray', '#5fba7d'], # Red-Gray-Green
-                            color_continuous_midpoint=0,
-                            custom_data=['Performance_5D']) # 툴팁 및 텍스트 표시용 원본 데이터
+        # 2. 자금 흐름 분석 섹션 (탭으로 분리)
+        st.subheader("📊 자금 흐름 분석")
+        tab1, tab2 = st.tabs(["전체 섹터 흐름 (11 Sectors)", "핵심 테마 & 자산군"])
 
-            # 타일 위에 섹터 이름과 실제 수익률(%)을 정확히 표시
-            fig.update_traces(texttemplate='%{label}<br>%{customdata[0]:.2f}%')
+        with tab1:
+            # ✨ [복원] 11개 섹터 히트맵
+            st.markdown("###### 5일 누적 수익률 기준")
+            sector_perf_df = get_sector_performance()
+            if not sector_perf_df.empty:
+                fig = px.treemap(sector_perf_df, 
+                                 path=[px.Constant("S&P 500 Sectors"), 'Sector'], 
+                                 values=sector_perf_df['Performance_5D'].abs(),
+                                 color='Performance_5D',
+                                 color_continuous_scale=['#d65f5f', 'lightgray', '#5fba7d'],
+                                 color_continuous_midpoint=0,
+                                 custom_data=['Performance_5D'])
+                fig.update_traces(texttemplate='%{label}<br>%{customdata[0]:.2f}%')
+                fig.update_layout(margin=dict(t=0, l=0, r=0, b=0))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("섹터 성과 데이터를 가져오는 데 실패했습니다.")
+
+        with tab2:
+            # ✨ [재구성] 테마 & 자산군 대시보드
+            st.markdown("###### 당일 등락률 기준 (vs S&P 500)")
+            theme_perf = get_theme_etf_performance()
+            if theme_perf:
+                # ... (이하 테마 ETF를 표시하는 display_etf_metric 함수 및 UI 로직은 이전과 동일) ...
+                spy_perf_change = theme_perf.get("S&P 500", {}).get('change_percent', 0)
+                def display_etf_metric(col, theme_name):
+                    perf_data = theme_perf.get(theme_name, {})
+                    perf_change = perf_data.get('change_percent', 0)
+                    trend = perf_data.get('trend', '횡보')
+                    trend_icon = "🔼" if trend == "상승" else "🔽" if trend == "하락" else "⏺️"
+                    delta_vs_spy = perf_change - spy_perf_change
+                    col.metric(
+                        label=f"{trend_icon} {theme_name}",
+                        value=f"{perf_change:.2f}%",
+                        delta=f"{delta_vs_spy:.2f}% vs SPY",
+                        delta_color="off" if abs(delta_vs_spy) < 0.01 else ("normal")
+                    )
+                st.markdown("<h6>1. 시장 성격 (Style)</h6>", unsafe_allow_html=True)
+                cols = st.columns(2); display_etf_metric(cols[0], "가치주"); display_etf_metric(cols[1], "성장주")
+                st.markdown("<h6>2. 핵심 기술 (Core Tech)</h6>", unsafe_allow_html=True)
+                cols = st.columns(2); display_etf_metric(cols[0], "반도체"); display_etf_metric(cols[1], "AI")
+                st.markdown("<h6>3. 미래 테마 (Future Forward)</h6>", unsafe_allow_html=True)
+                cols = st.columns(3); display_etf_metric(cols[0], "로보틱스"); display_etf_metric(cols[1], "바이오테크"); display_etf_metric(cols[2], "차세대 전력")
+                st.markdown("<h6>4. 방어 & 인컴 (Defense & Income)</h6>", unsafe_allow_html=True)
+                cols = st.columns(2); display_etf_metric(cols[0], "고배당"); display_etf_metric(cols[1], "장기채")
+                st.markdown("<h6>5. 시장 심리 (Sentiment)</h6>", unsafe_allow_html=True)
+                cols = st.columns(2); display_etf_metric(cols[0], "혁신기술"); display_etf_metric(cols[1], "비트코인")
+            else:
+                st.warning("테마/자산군 ETF 성과 데이터를 가져오는 데 실패했습니다.")
+
+        # --- [MOD v40 End] ---
+        
+        st.divider()
+        st.subheader("🗓️ 향후 2주 주요 이벤트")
+
+        # 데이터 로드
+        eco_events = get_economic_calendar()
+        
+        # 포트폴리오 및 관심종목 티커 목록 가져오기
+        portfolio_tickers = st.session_state.portfolio_df['종목코드'].dropna().unique().tolist()
+        watchlist_tickers = st.session_state.watchlist_df['종목코드'].dropna().unique().tolist()
+        all_my_tickers = list(set(portfolio_tickers + watchlist_tickers))
+        
+        earnings_events = get_portfolio_earnings_calendar(all_my_tickers)
+
+        # 두 이벤트 리스트를 날짜 기준으로 통합하고 정렬
+        combined_events = []
+        for event in eco_events:
+            combined_events.append({'date': event['time'].split(' ')[0], 'type': 'eco', 'data': event})
+        for event in earnings_events:
+            combined_events.append({'date': event['date'], 'type': 'earn', 'data': event})
             
-            fig.update_layout(margin=dict(t=25, l=0, r=0, b=0)) # 상단 여백 추가
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.warning("섹터 성과 데이터를 가져오는 데 실패했습니다.")
-        # --- [MOD v35.6 End] ---
+        sorted_events = sorted(combined_events, key=lambda x: x['date'])
 
+        if sorted_events:
+            cols = st.columns(2)
+            col_idx = 0
+            
+            for event in sorted_events:
+                event_date = datetime.strptime(event['date'], '%Y-%m-%d').strftime('%m/%d (%a)')
+                
+                # 좌우 컬럼에 번갈아 가며 이벤트 표시
+                with cols[col_idx % 2]:
+                    if event['type'] == 'eco':
+                        impact = event['data']['impact']
+                        impact_icon = "🔴" if impact == 'high' else "🟠" if impact == 'medium' else ""
+                        st.markdown(f"**{event_date}**: {impact_icon} {event['data']['event']}")
+                    elif event['type'] == 'earn':
+                        st.markdown(f"**{event_date}**: 📢 Earnings - **${event['data']['ticker']}**")
+                col_idx += 1
+        else:
+            st.info("향후 2주 내에 예정된 주요 이벤트가 없습니다.")
+        # --- [MOD v41 End] ---
         st.subheader("주요 경제 뉴스")
         if market_data.get('news'):
             for item in market_data['news']:
