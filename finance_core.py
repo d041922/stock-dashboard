@@ -1467,7 +1467,10 @@ elif st.session_state.active_view == "💼 포트폴리오":
 
     if not portfolio_df.empty or not cash_df.empty:
         # --- 1. 모든 데이터 준비 및 최종 데이터프레임 생성 ---
-        all_tickers_for_price = portfolio_df['종목코드'].dropna().unique().tolist()
+        all_tickers_for_price_raw = portfolio_df['종목코드'].dropna().unique().tolist()
+        # ✨ [핵심 수정] API로 조회할 티커 리스트에서 '.KS' 종목 제외
+        all_tickers_for_price = [ticker for ticker in all_tickers_for_price_raw if not ticker.endswith('.KS')]
+
         if all_tickers_for_price:
             current_prices, usd_krw_rate = get_current_prices_and_rate(all_tickers_for_price)
             st.sidebar.metric("USD/KRW 환율", f"₩{usd_krw_rate:,.2f}")
